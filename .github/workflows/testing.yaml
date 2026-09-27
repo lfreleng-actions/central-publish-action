@@ -55,19 +55,13 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
-      contents: read  # Required to check out the code under test.
+      contents: read  # Read repository contents
     steps:
       # Harden the runner used by this workflow
       # yamllint disable-line rule:line-length
       - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
         with:
           egress-policy: audit
-
-      - name: Checkout action
-        # yamllint disable-line rule:line-length
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
 
       - name: Determine test mode
         id: mode
@@ -224,7 +218,7 @@ jobs:
           find "${GITHUB_WORKSPACE}/m2repo" -type f | sort
 
       - name: Run central-publish-action
-        uses: ./
+        uses: $/
         with:
           m2repo-path: m2repo
           central-username: ${{ secrets.CENTRAL_USERNAME }}
