@@ -27,6 +27,7 @@ on:
     paths:
       - "action.yaml"
       - "scripts/**"
+      - "tests/**"
       - ".github/workflows/testing.yaml"
   # Deliberately pull_request (not pull_request_target): the job checks out
   # and runs the code under test, so it must stay unprivileged. Fork PRs
@@ -37,6 +38,7 @@ on:
     paths:
       - "action.yaml"
       - "scripts/**"
+      - "tests/**"
       - ".github/workflows/testing.yaml"
 
 permissions: {}
@@ -227,3 +229,160 @@ jobs:
           signing-method: ${{ steps.mode.outputs.signing-method }}
           publishing-type: ${{ inputs.publishing-type || 'USER_MANAGED' }}
           dry-run: ${{ steps.mode.outputs.dry-run }}
+
+  mock-portal:
+    name: 'Mock Portal Tests'
+    # Exercises the scripts against tests/mock_central.py; needs no secrets,
+    # so it runs in full on fork pull requests too.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read  # Read repository contents
+    steps:
+      # Harden the runner used by this workflow
+      # yamllint disable-line rule:line-length
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+
+      # yamllint disable-line rule:line-length
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Run script tests
+        run: python3 -m unittest discover -s tests -t . -v
+
+      # End to end: stage with the action, then release that deployment.
+      - name: Start mock Central Portal
+        run: |
+          set -euo pipefail
+          nohup python3 tests/mock_central.py --port 8765 \
+            > "${RUNNER_TEMP}/mock-central.log" 2>&1 &
+          for _ in $(seq 1 30); do
+            if curl -s -o /dev/null http://127.0.0.1:8765/; then
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::Mock Central Portal did not start"
+          exit 1
+
+      - name: Generate a throwaway signing key
+        id: key
+        run: |
+          set -euo pipefail
+          export GNUPGHOME="${RUNNER_TEMP}/throwaway-gnupg"
+          mkdir -m 700 "$GNUPGHOME"
+          gpg --batch --pinentry-mode loopback --passphrase '' \
+            --quick-gen-key 'CPA CI <ci@example.invalid>' ed25519 sign never
+          key="$(gpg --armor --export-secret-keys ci@example.invalid | base64 -w0)"
+          echo "::add-mask::${key}"
+          echo "private-key=${key}" >> "$GITHUB_OUTPUT"
+
+      - name: Create test Maven repository
+        run: python3 tests/fixtures.py m2repo
+
+      - name: Stage (upload mode, USER_MANAGED)
+        id: stage
+        uses: $/
+        with:
+          m2repo-path: m2repo
+          central-url: http://127.0.0.1:8765
+          central-username: user
+          central-token: token
+          gpg-private-key: ${{ steps.key.outputs.private-key }}
+          poll-interval: "1"
+          poll-timeout: "30"
+
+      - name: Check staging signed every artefact
+        env:
+          STATUS: ${{ steps.stage.outputs.deployment_status }}
+        run: |
+          set -euo pipefail
+          test "$STATUS" = VALIDATED
+          python3 - << 'PYEOF'
+          from pathlib import Path
+          from tests.fixtures import ARTEFACTS
+          missing = [a for a in ARTEFACTS if not Path("m2repo", a + ".asc").is_file()]
+          print("Unsigned:", missing or "none")
+          raise SystemExit(1 if missing else 0)
+          PYEOF
+
+      - name: Release (publish mode)
+        id: release
+        uses: $/
+        with:
+          mode: publish
+          deployment-id: ${{ steps.stage.outputs.deployment_id }}
+          m2repo-path: m2repo
+          central-url: http://127.0.0.1:8765
+          central-username: user
+          central-token: token
+          poll-interval: "1"
+          poll-timeout: "30"
+
+      - name: Re-run release (already published)
+        id: rerun
+        uses: $/
+        with:
+          mode: publish
+          deployment-id: ${{ steps.stage.outputs.deployment_id }}
+          m2repo-path: m2repo
+          central-url: http://127.0.0.1:8765
+          central-username: user
+          central-token: token
+          poll-interval: "1"
+          poll-timeout: "30"
+
+      - name: Stage again (upload mode, sigul pre-signed)
+        id: stage-again
+        uses: $/
+        with:
+          m2repo-path: m2repo
+          central-url: http://127.0.0.1:8765
+          central-username: user
+          central-token: token
+          signing-method: sigul
+          poll-interval: "1"
+          poll-timeout: "30"
+
+      - name: Change an artefact after staging
+        run: echo tampered >> m2repo/org/example/demo/1.0.0/demo-1.0.0.war
+
+      - name: Release a deployment that no longer matches
+        id: mismatch
+        continue-on-error: true
+        uses: $/
+        with:
+          mode: publish
+          deployment-id: ${{ steps.stage-again.outputs.deployment_id }}
+          m2repo-path: m2repo
+          central-url: http://127.0.0.1:8765
+          central-username: user
+          central-token: token
+          poll-interval: "1"
+          poll-timeout: "30"
+
+      - name: Check release results
+        env:
+          DEPLOYMENT_ID: ${{ steps.stage.outputs.deployment_id }}
+          RELEASE_STATUS: ${{ steps.release.outputs.deployment_status }}
+          RELEASE_VERIFIED: ${{ steps.release.outputs.verified_file_count }}
+          RERUN_STATUS: ${{ steps.rerun.outputs.deployment_status }}
+          MISMATCH_OUTCOME: ${{ steps.mismatch.outcome }}
+          MISMATCH_ID: ${{ steps.stage-again.outputs.deployment_id }}
+        run: |
+          set -euo pipefail
+          mock='http://127.0.0.1:8765/_mock/deployments'
+          test "$RELEASE_STATUS" = PUBLISHED
+          test "$RELEASE_VERIFIED" -gt 0
+          test "$RERUN_STATUS" = PUBLISHED
+          test "$(curl -sf "${mock}/${DEPLOYMENT_ID}" | jq .publishCalls)" = 1
+          test "$MISMATCH_OUTCOME" = failure
+          test "$(curl -sf "${mock}/${MISMATCH_ID}" | jq .publishCalls)" = 0
+          echo "Release, idempotent re-run and mismatch checks passed"
+
+      - name: Show mock Central Portal log
+        if: always()
+        run: cat "${RUNNER_TEMP}/mock-central.log" || true
