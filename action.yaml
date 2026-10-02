@@ -75,40 +75,7 @@ runs:
         INPUT_M2REPO: "${{ inputs.m2repo-path }}"
         INPUT_SIGNING_METHOD: "${{ inputs.signing-method }}"
         INPUT_GPG_KEY_PROVIDED: "${{ inputs.gpg-private-key != '' }}"
-      run: |
-        # SPDX-License-Identifier: Apache-2.0
-        set -euo pipefail
-
-        M2REPO="$INPUT_M2REPO"
-        SIGNING_METHOD="$INPUT_SIGNING_METHOD"
-
-        case "$SIGNING_METHOD" in
-          gpg|sigul|none) ;;
-          *)
-            echo "::error::Invalid signing-method '$SIGNING_METHOD' (expected: gpg, sigul, or none)"
-            exit 1
-            ;;
-        esac
-
-        if [ "$SIGNING_METHOD" = "gpg" ] && [ "$INPUT_GPG_KEY_PROVIDED" != "true" ]; then
-          echo "::error::signing-method is 'gpg' but gpg-private-key is empty"
-          exit 1
-        fi
-
-        if [ ! -d "$M2REPO" ]; then
-          echo "::error::m2repo-path '$M2REPO' does not exist or is not a directory"
-          exit 1
-        fi
-
-        ARTIFACT_COUNT=$(find "$M2REPO" -name "*.pom" | wc -l)
-        if [ "$ARTIFACT_COUNT" -eq 0 ]; then
-          echo "::error::No .pom files found in '$M2REPO' — is this a valid Maven repo?"
-          exit 1
-        fi
-
-        echo "Signing method: $SIGNING_METHOD"
-        echo "Found $ARTIFACT_COUNT POM(s) in $M2REPO"
-        echo "artifact-count=$ARTIFACT_COUNT" >> "$GITHUB_OUTPUT"
+      run: bash "${GITHUB_ACTION_PATH}/scripts/validate.sh"
 
     - name: Import GPG key
       id: gpg
@@ -144,35 +111,7 @@ runs:
         GPG_KEY_ID: "${{ steps.gpg.outputs.key-id }}"
         GPG_PASSPHRASE: "${{ inputs.gpg-passphrase }}"
         INPUT_M2REPO: "${{ inputs.m2repo-path }}"
-      run: |
-        # SPDX-License-Identifier: Apache-2.0
-        set -euo pipefail
-
-        M2REPO="$INPUT_M2REPO"
-        SIGN_COUNT=0
-
-        # Sign all .jar and .pom files
-        find "$M2REPO" -type f \( -name "*.jar" -o -name "*.pom" -o -name "*.module" \) | \
-        while read -r file; do
-          if [ -f "${file}.asc" ]; then
-            echo "  Skip (already signed): $(basename "$file")"
-            continue
-          fi
-
-          if [ -n "$GPG_PASSPHRASE" ]; then
-            gpg --batch --pinentry-mode loopback --passphrase "$GPG_PASSPHRASE" \
-              --local-user "$GPG_KEY_ID" --armor --detach-sign "$file"
-          else
-            gpg --batch --pinentry-mode loopback \
-              --local-user "$GPG_KEY_ID" --armor --detach-sign "$file"
-          fi
-
-          SIGN_COUNT=$((SIGN_COUNT + 1))
-        done
-
-        ASC_COUNT=$(find "$M2REPO" -name "*.asc" | wc -l)
-        echo "Signed artifacts: $ASC_COUNT .asc files created"
-        echo "sign-count=$ASC_COUNT" >> "$GITHUB_OUTPUT"
+      run: bash "${GITHUB_ACTION_PATH}/scripts/sign.sh"
 
     - name: Verify pre-signed artifacts
       id: verify-sign
@@ -180,70 +119,14 @@ runs:
       shell: bash
       env:
         INPUT_M2REPO: "${{ inputs.m2repo-path }}"
-      run: |
-        # SPDX-License-Identifier: Apache-2.0
-        set -euo pipefail
-
-        M2REPO="$INPUT_M2REPO"
-        MISSING=0
-        ASC_COUNT=0
-
-        # Every deployable artifact (same set GPG would sign) MUST have a
-        # detached signature produced by the caller (e.g. sigul-sign-action).
-        while read -r file; do
-          if [ -f "${file}.asc" ]; then
-            ASC_COUNT=$((ASC_COUNT + 1))
-          else
-            echo "::error::Missing signature for $(basename "$file") (.asc not found)"
-            MISSING=$((MISSING + 1))
-          fi
-        done < <(find "$M2REPO" -type f \
-          \( -name "*.jar" -o -name "*.pom" -o -name "*.module" \))
-
-        if [ "$MISSING" -gt 0 ]; then
-          echo "::error::signing-method 'sigul' requires pre-signed artifacts, but $MISSING signature(s) are missing"
-          exit 1
-        fi
-
-        echo "Verified $ASC_COUNT pre-signed artifact(s)"
-        echo "sign-count=$ASC_COUNT" >> "$GITHUB_OUTPUT"
+      run: bash "${GITHUB_ACTION_PATH}/scripts/verify-signatures.sh"
 
     - name: Create bundle ZIP
       id: bundle
       shell: bash
       env:
         INPUT_M2REPO: "${{ inputs.m2repo-path }}"
-      run: |
-        # SPDX-License-Identifier: Apache-2.0
-        set -euo pipefail
-
-        M2REPO="$INPUT_M2REPO"
-        BUNDLE_DIR="${GITHUB_WORKSPACE}/central-bundle"
-        BUNDLE_PATH="${BUNDLE_DIR}/bundle.zip"
-        mkdir -p "$BUNDLE_DIR"
-
-        # Bundle must contain artifacts in Maven directory structure
-        # (relative paths from the repo root)
-        cd "$M2REPO"
-
-        # Central Portal REQUIRES .md5 and .sha1 checksums for each artifact
-        echo "Generating checksums..."
-        find . -type f \
-          ! -name "*.md5" ! -name "*.sha1" ! -name "*.sha256" ! -name "*.sha512" \
-          ! -name "maven-metadata.xml*" ! -name "_remote.repositories" \
-          | while read -r file; do
-            md5sum "$file" | awk '{print $1}' > "${file}.md5"
-            sha1sum "$file" | awk '{print $1}' > "${file}.sha1"
-          done
-
-        zip -r "$BUNDLE_PATH" . \
-          -x "*.sha256" -x "*.sha512" \
-          -x "maven-metadata.xml*" -x "_remote.repositories"
-
-        BUNDLE_SIZE=$(stat -c%s "$BUNDLE_PATH" 2>/dev/null || stat -f%z "$BUNDLE_PATH")
-        echo "Bundle created: $BUNDLE_PATH ($(numfmt --to=iec "$BUNDLE_SIZE"))"
-        echo "bundle_path=$BUNDLE_PATH" >> "$GITHUB_OUTPUT"
-        echo "bundle-size=$BUNDLE_SIZE" >> "$GITHUB_OUTPUT"
+      run: bash "${GITHUB_ACTION_PATH}/scripts/bundle.sh"
 
     - name: Upload bundle to Central Portal
       id: upload
@@ -254,31 +137,8 @@ runs:
         CENTRAL_TOKEN: "${{ inputs.central-token }}"
         INPUT_PUBLISHING_TYPE: "${{ inputs.publishing-type }}"
         BUNDLE_PATH: "${{ steps.bundle.outputs.bundle_path }}"
-      run: |
-        # SPDX-License-Identifier: Apache-2.0
-        set -euo pipefail
-
-        PUBLISHING_TYPE="$INPUT_PUBLISHING_TYPE"
-
-        # Generate Bearer token: base64(username:password)
-        AUTH_TOKEN=$(echo -n "${CENTRAL_USERNAME}:${CENTRAL_TOKEN}" | base64 -w0)
-        echo "::add-mask::$AUTH_TOKEN"
-
-        echo "Uploading bundle to Central Portal (publishingType=$PUBLISHING_TYPE)..."
-
-        RESPONSE=$(curl -sf -X POST \
-          "https://central.sonatype.com/api/v1/publisher/upload?publishingType=${PUBLISHING_TYPE}" \
-          -H "Authorization: Bearer $AUTH_TOKEN" \
-          -F "bundle=@${BUNDLE_PATH};type=application/octet-stream" \
-          2>&1) || {
-            echo "::error::Upload failed. Response: $RESPONSE"
-            exit 1
-          }
-
-        # Response is just the deployment ID (plain text)
-        DEPLOYMENT_ID="$RESPONSE"
-        echo "Deployment ID: $DEPLOYMENT_ID"
-        echo "deployment_id=$DEPLOYMENT_ID" >> "$GITHUB_OUTPUT"
+        CENTRAL_URL: "https://central.sonatype.com"
+      run: bash "${GITHUB_ACTION_PATH}/scripts/upload.sh"
 
     - name: Poll deployment status
       id: poll
@@ -291,81 +151,8 @@ runs:
         INPUT_POLL_TIMEOUT: "${{ inputs.poll-timeout }}"
         INPUT_POLL_INTERVAL: "${{ inputs.poll-interval }}"
         DEPLOYMENT_ID: "${{ steps.upload.outputs.deployment_id }}"
-      run: |
-        # SPDX-License-Identifier: Apache-2.0
-        set -euo pipefail
-
-        TIMEOUT="$INPUT_POLL_TIMEOUT"
-        INTERVAL="$INPUT_POLL_INTERVAL"
-
-        AUTH_TOKEN=$(echo -n "${CENTRAL_USERNAME}:${CENTRAL_TOKEN}" | base64 -w0)
-        echo "::add-mask::$AUTH_TOKEN"
-
-        echo "Polling deployment status (timeout: ${TIMEOUT}s, interval: ${INTERVAL}s)..."
-
-        ELAPSED=0
-        FINAL_STATUS="UNKNOWN"
-
-        while [ "$ELAPSED" -lt "$TIMEOUT" ]; do
-          RESPONSE=$(curl -s -X POST \
-            "https://central.sonatype.com/api/v1/publisher/status?id=${DEPLOYMENT_ID}" \
-            -H "Authorization: Bearer $AUTH_TOKEN" \
-            -H "Content-Type: application/json" \
-            -w "\n%{http_code}" \
-            2>&1)
-
-          HTTP_CODE=$(echo "$RESPONSE" | tail -1)
-          BODY=$(echo "$RESPONSE" | sed '$d')
-
-          if [ "$HTTP_CODE" != "200" ]; then
-            echo "  Poll request failed (HTTP $HTTP_CODE), retrying..."
-            sleep "$INTERVAL"
-            ELAPSED=$((ELAPSED + INTERVAL))
-            continue
-          fi
-
-          STATUS=$(echo "$BODY" | jq -r '.deploymentState // .state // "UNKNOWN"')
-          echo "  [$ELAPSED s] Status: $STATUS"
-
-          case "$STATUS" in
-            PUBLISHED)
-              FINAL_STATUS="PUBLISHED"
-              echo "✅ Deployment PUBLISHED successfully!"
-              break
-              ;;
-            VALIDATED)
-              FINAL_STATUS="VALIDATED"
-              if [ "$INPUT_PUBLISHING_TYPE" = "USER_MANAGED" ]; then
-                echo "✅ Deployment VALIDATED (USER_MANAGED — not auto-published)"
-                break
-              fi
-              echo "  Waiting for publication..."
-              ;;
-            FAILED)
-              FINAL_STATUS="FAILED"
-              echo "::error::Deployment FAILED"
-              echo "$BODY" | jq '.errors // .' 2>/dev/null || echo "$BODY"
-              exit 1
-              ;;
-            PENDING|VALIDATING|PUBLISHING)
-              # Still in progress
-              ;;
-            *)
-              echo "  Unknown status: $STATUS"
-              ;;
-          esac
-
-          sleep "$INTERVAL"
-          ELAPSED=$((ELAPSED + INTERVAL))
-        done
-
-        if [ "$ELAPSED" -ge "$TIMEOUT" ] && [ "$FINAL_STATUS" != "PUBLISHED" ] && \
-           [ "$FINAL_STATUS" != "VALIDATED" ]; then
-          echo "::error::Timed out waiting for deployment (last status: $FINAL_STATUS)"
-          exit 1
-        fi
-
-        echo "deployment_status=$FINAL_STATUS" >> "$GITHUB_OUTPUT"
+        CENTRAL_URL: "https://central.sonatype.com"
+      run: bash "${GITHUB_ACTION_PATH}/scripts/poll.sh"
 
     - name: Generate summary
       if: always()
