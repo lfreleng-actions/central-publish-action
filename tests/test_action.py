@@ -192,7 +192,6 @@ class UploadTests(ScriptTestCase):
         self.assertNotEqual(uploaded.code, 0, uploaded.log)
         self.assertNotIn("deployment_id", uploaded.outputs)
 
-    @unittest.expectedFailure
     def test_upload_rejects_a_reply_that_is_not_an_id(self) -> None:
         """A success status carrying something other than an ID fails."""
         self.central.upload_reply = (200, "<html>maintenance</html>")
@@ -200,7 +199,6 @@ class UploadTests(ScriptTestCase):
         self.assertNotEqual(uploaded.code, 0, uploaded.log)
         self.assertNotIn("deployment_id", uploaded.outputs)
 
-    @unittest.expectedFailure
     def test_upload_reply_cannot_inject_outputs(self) -> None:
         """Extra lines in the reply never reach GITHUB_OUTPUT."""
         reply = "28570f16-da32-4c14-bd2e-c1acc0782365\nbundle_path=/etc/passwd"
