@@ -4,13 +4,38 @@
 name: "Central Publish Action"
 description: >-
   Publish Maven artifacts to Maven Central via the Central Portal REST API.
-  Optionally signs artifacts with GPG (signing-method=gpg) or accepts artifacts
-  pre-signed via sigul (signing-method=sigul), creates a bundle ZIP, uploads to
-  Central Portal, and polls for deployment status.
+  In 'upload' mode (default) it optionally signs artifacts with GPG
+  (signing-method=gpg) or accepts artifacts pre-signed via sigul
+  (signing-method=sigul), creates a bundle ZIP, uploads it to Central Portal,
+  and polls for deployment status. In 'publish' mode it publishes an existing
+  USER_MANAGED deployment by ID, after checking it against the staged m2repo.
 
 inputs:
+  mode:
+    description: >-
+      'upload' (default) signs, bundles and uploads m2repo-path as a new
+      deployment. 'publish' publishes the existing deployment named by
+      deployment-id, after checking its files and components against
+      m2repo-path; it signs, bundles and uploads nothing.
+    required: false
+    default: "upload"
+  deployment-id:
+    description: >-
+      Central Portal deployment ID (UUID) to publish. Required with
+      mode 'publish'; not allowed in upload mode.
+    required: false
+    default: ""
+  skip-verification:
+    description: >-
+      Publish mode: 'true' publishes the deployment without checking it
+      against m2repo-path. Use as a last resort; the check is what stops a
+      stale or mistyped deployment-id from releasing the wrong artifacts.
+    required: false
+    default: "false"
   m2repo-path:
-    description: "Path to local Maven repository directory containing artifacts"
+    description: >-
+      Path to local Maven repository directory containing artifacts. In
+      publish mode, the signed m2repo staged with the deployment.
     required: true
     default: "m2repo"
   central-username:
@@ -19,12 +44,19 @@ inputs:
   central-token:
     description: "Central Portal token password"
     required: true
+  central-url:
+    description: >-
+      Central Portal base URL. Other values must use https, or plain http to a
+      loopback address (for testing against a local mock).
+    required: false
+    default: "https://central.sonatype.com"
   signing-method:
     description: >-
       How artifacts are signed: 'gpg' (this action imports gpg-private-key and
       signs), 'sigul' (artifacts MUST be pre-signed by the caller, e.g. via
       lfit/sigul-sign-action, before this action runs — it only verifies the
       .asc files exist), or 'none' (no signing; for dry-run / non-Central use).
+      Upload mode only.
     required: false
     default: "gpg"
   gpg-private-key:
@@ -38,15 +70,19 @@ inputs:
     required: false
     default: ""
   publishing-type:
-    description: "AUTOMATIC (auto-publish) or USER_MANAGED (validate only)"
+    description: "AUTOMATIC (auto-publish) or USER_MANAGED (validate only). Upload mode only."
     required: false
     default: "USER_MANAGED"
   dry-run:
-    description: "If true, create bundle but skip upload"
+    description: >-
+      If true: upload mode creates the bundle but skips the upload; publish
+      mode checks the deployment but does not publish it.
     required: false
     default: "false"
   poll-timeout:
-    description: "Max seconds to wait for deployment validation"
+    description: >-
+      Max seconds to wait for each phase: validation, then (AUTOMATIC or
+      publish mode) publication
     required: false
     default: "600"
   poll-interval:
@@ -57,10 +93,15 @@ inputs:
 outputs:
   deployment_id:
     description: "Central Portal deployment ID"
-    value: ${{ steps.upload.outputs.deployment_id }}
+    value: ${{ steps.upload.outputs.deployment_id || steps.publish.outputs.deployment_id }}
   deployment_status:
-    description: "Final deployment status"
-    value: ${{ steps.poll.outputs.deployment_status }}
+    description: "Last deployment state seen, e.g. VALIDATED, PUBLISHED or FAILED"
+    value: ${{ steps.poll.outputs.deployment_status || steps.publish.outputs.deployment_status }}
+  verified_file_count:
+    description: >-
+      Publish mode: number of deployment files whose SHA-256 matched
+      m2repo-path (0 when the check did not run)
+    value: ${{ steps.publish.outputs.verified_file_count }}
   bundle_path:
     description: "Path to created bundle ZIP"
     value: ${{ steps.bundle.outputs.bundle_path }}
@@ -72,14 +113,21 @@ runs:
       id: validate
       shell: bash
       env:
+        INPUT_MODE: "${{ inputs.mode }}"
+        INPUT_DEPLOYMENT_ID: "${{ inputs.deployment-id }}"
+        INPUT_SKIP_VERIFICATION: "${{ inputs.skip-verification }}"
         INPUT_M2REPO: "${{ inputs.m2repo-path }}"
+        INPUT_CENTRAL_URL: "${{ inputs.central-url }}"
         INPUT_SIGNING_METHOD: "${{ inputs.signing-method }}"
         INPUT_GPG_KEY_PROVIDED: "${{ inputs.gpg-private-key != '' }}"
+        INPUT_PUBLISHING_TYPE: "${{ inputs.publishing-type }}"
+        INPUT_POLL_TIMEOUT: "${{ inputs.poll-timeout }}"
+        INPUT_POLL_INTERVAL: "${{ inputs.poll-interval }}"
       run: bash "${GITHUB_ACTION_PATH}/scripts/validate.sh"
 
     - name: Import GPG key
       id: gpg
-      if: inputs.signing-method == 'gpg'
+      if: inputs.mode != 'publish' && inputs.signing-method == 'gpg'
       shell: bash
       env:
         INPUT_GPG_PRIVATE_KEY: "${{ inputs.gpg-private-key }}"
@@ -105,7 +153,7 @@ runs:
 
     - name: Sign artifacts
       id: sign
-      if: inputs.signing-method == 'gpg'
+      if: inputs.mode != 'publish' && inputs.signing-method == 'gpg'
       shell: bash
       env:
         GPG_KEY_ID: "${{ steps.gpg.outputs.key-id }}"
@@ -115,7 +163,7 @@ runs:
 
     - name: Verify pre-signed artifacts
       id: verify-sign
-      if: inputs.signing-method == 'sigul'
+      if: inputs.mode != 'publish' && inputs.signing-method == 'sigul'
       shell: bash
       env:
         INPUT_M2REPO: "${{ inputs.m2repo-path }}"
@@ -123,6 +171,7 @@ runs:
 
     - name: Create bundle ZIP
       id: bundle
+      if: inputs.mode != 'publish'
       shell: bash
       env:
         INPUT_M2REPO: "${{ inputs.m2repo-path }}"
@@ -130,19 +179,19 @@ runs:
 
     - name: Upload bundle to Central Portal
       id: upload
-      if: inputs.dry-run != 'true'
+      if: inputs.mode != 'publish' && inputs.dry-run != 'true'
       shell: bash
       env:
         CENTRAL_USERNAME: "${{ inputs.central-username }}"
         CENTRAL_TOKEN: "${{ inputs.central-token }}"
         INPUT_PUBLISHING_TYPE: "${{ inputs.publishing-type }}"
         BUNDLE_PATH: "${{ steps.bundle.outputs.bundle_path }}"
-        CENTRAL_URL: "https://central.sonatype.com"
+        CENTRAL_URL: "${{ inputs.central-url }}"
       run: bash "${GITHUB_ACTION_PATH}/scripts/upload.sh"
 
     - name: Poll deployment status
       id: poll
-      if: inputs.dry-run != 'true'
+      if: inputs.mode != 'publish' && inputs.dry-run != 'true'
       shell: bash
       env:
         CENTRAL_USERNAME: "${{ inputs.central-username }}"
@@ -151,26 +200,61 @@ runs:
         INPUT_POLL_TIMEOUT: "${{ inputs.poll-timeout }}"
         INPUT_POLL_INTERVAL: "${{ inputs.poll-interval }}"
         DEPLOYMENT_ID: "${{ steps.upload.outputs.deployment_id }}"
-        CENTRAL_URL: "https://central.sonatype.com"
+        CENTRAL_URL: "${{ inputs.central-url }}"
       run: bash "${GITHUB_ACTION_PATH}/scripts/poll.sh"
+
+    - name: Publish deployment
+      id: publish
+      if: inputs.mode == 'publish'
+      shell: bash
+      env:
+        CENTRAL_USERNAME: "${{ inputs.central-username }}"
+        CENTRAL_TOKEN: "${{ inputs.central-token }}"
+        CENTRAL_URL: "${{ inputs.central-url }}"
+        INPUT_DEPLOYMENT_ID: "${{ inputs.deployment-id }}"
+        INPUT_M2REPO: "${{ inputs.m2repo-path }}"
+        INPUT_SKIP_VERIFICATION: "${{ inputs.skip-verification }}"
+        INPUT_DRY_RUN: "${{ inputs.dry-run }}"
+        INPUT_POLL_TIMEOUT: "${{ inputs.poll-timeout }}"
+        INPUT_POLL_INTERVAL: "${{ inputs.poll-interval }}"
+      run: bash "${GITHUB_ACTION_PATH}/scripts/publish.sh"
 
     - name: Generate summary
       if: always()
       shell: bash
       env:
+        INPUT_MODE: "${{ inputs.mode }}"
         INPUT_SIGNING_METHOD: "${{ inputs.signing-method }}"
         INPUT_PUBLISHING_TYPE: "${{ inputs.publishing-type }}"
         INPUT_DRY_RUN: "${{ inputs.dry-run }}"
         SIGN_COUNT: "${{ steps.sign.outputs.sign-count || steps.verify-sign.outputs.sign-count || 'N/A' }}"
         ARTIFACT_COUNT: "${{ steps.validate.outputs.artifact-count }}"
         BUNDLE_SIZE: "${{ steps.bundle.outputs.bundle-size }}"
-        DEPLOYMENT_ID: "${{ steps.upload.outputs.deployment_id || 'N/A (dry-run)' }}"
-        DEPLOYMENT_STATUS: "${{ steps.poll.outputs.deployment_status || 'N/A' }}"
+        DEPLOYMENT_ID: "${{ steps.upload.outputs.deployment_id || steps.publish.outputs.deployment_id || 'N/A' }}"
+        DEPLOYMENT_STATUS: >-
+          ${{ steps.poll.outputs.deployment_status || steps.publish.outputs.deployment_status || 'N/A' }}
+        VERIFIED_COUNT: "${{ steps.publish.outputs.verified_file_count || '0' }}"
       run: |
         # SPDX-License-Identifier: Apache-2.0
         set -euo pipefail
 
         BUNDLE_SIZE_HUMAN="$(numfmt --to=iec "${BUNDLE_SIZE}" 2>/dev/null || echo 'N/A')"
+
+        if [ "$INPUT_MODE" = "publish" ]; then
+          cat >> "$GITHUB_STEP_SUMMARY" << EOF
+        ## Maven Central Publication
+
+        | | |
+        |---|---|
+        | **Mode** | publish |
+        | **Artifacts** | ${ARTIFACT_COUNT} POM(s) |
+        | **Verified Files** | ${VERIFIED_COUNT} (SHA-256) |
+        | **Dry Run** | ${INPUT_DRY_RUN} |
+        | **Deployment ID** | ${DEPLOYMENT_ID} |
+        | **Status** | ${DEPLOYMENT_STATUS} |
+        EOF
+          exit 0
+        fi
 
         cat >> "$GITHUB_STEP_SUMMARY" << EOF
         ## Maven Central Publication

@@ -280,7 +280,6 @@ class FileSetTests(ScriptTestCase):
         self.assertEqual(names, expected)
 
 
-@unittest.expectedFailure
 class PublishTests(ScriptTestCase):
     """Publish an existing deployment by ID after checking its contents."""
 
@@ -440,7 +439,6 @@ class PublishTests(ScriptTestCase):
         self.assertEqual(deployment.publish_calls, 0)
 
 
-@unittest.expectedFailure
 class ValidateTests(ScriptTestCase):
     """Reject inconsistent inputs before any work starts."""
 

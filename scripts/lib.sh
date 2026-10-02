@@ -26,6 +26,29 @@ list_signable_files() {
   list_payload_files "$1" | awk '!/\.asc$/'
 }
 
+# list_component_purls DIR: print, sorted, the Maven package URL of each
+# component in DIR, one per POM, from the repository layout
+# <group path>/<artifactId>/<version>/<artifactId>-<version>*.pom.
+list_component_purls() {
+  list_payload_files "$1" | awk -F/ '
+    /\.pom$/ {
+      if (NF < 4 || index($NF, $(NF - 2) "-" $(NF - 1)) != 1) {
+        print "::error::" $0 " does not follow the Maven repository layout"
+        bad = 1
+        next
+      }
+      group = $1
+      for (i = 2; i <= NF - 3; i++) group = group "." $i
+      print "pkg:maven/" group "/" $(NF - 2) "@" $(NF - 1)
+    }
+    END { exit bad }' | LC_ALL=C sort -u
+}
+
+# uri_path PATH: percent-encode each segment of a relative path.
+uri_path() {
+  jq -rn --arg path "$1" '$path | split("/") | map(@uri) | join("/")'
+}
+
 # Central Portal deployment IDs are UUIDs; anything else is refused before
 # it reaches a URL or GITHUB_OUTPUT.
 DEPLOYMENT_ID_RE='^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
@@ -38,16 +61,21 @@ require_deployment_id() {
   fi
 }
 
-# central_init: check CENTRAL_URL and set AUTH_TOKEN for the Portal API.
-# Non-default URLs must use https, or plain http to a loopback address
-# (for a local mock), with no path, query or credentials.
-central_init() {
-  CENTRAL_URL="${CENTRAL_URL%/}"
-  if [[ ! "$CENTRAL_URL" =~ ^https://[A-Za-z0-9.-]+(:[0-9]{1,5})?$ ]] &&
-     [[ ! "$CENTRAL_URL" =~ ^http://(127\.0\.0\.1|localhost|\[::1\])(:[0-9]{1,5})?$ ]]; then
-    echo "::error::central-url '$CENTRAL_URL' must be https://host[:port] or a loopback http://host[:port]"
+# check_central_url URL: the default Portal, any other https://host[:port],
+# or plain http to a loopback address (for a local mock). No path, query
+# or credentials.
+check_central_url() {
+  if [[ ! "$1" =~ ^https://[A-Za-z0-9.-]+(:[0-9]{1,5})?$ ]] &&
+     [[ ! "$1" =~ ^http://(127\.0\.0\.1|localhost|\[::1\])(:[0-9]{1,5})?$ ]]; then
+    echo "::error::central-url '$1' must be https://host[:port] or a loopback http://host[:port]"
     return 1
   fi
+}
+
+# central_init: check CENTRAL_URL and set AUTH_TOKEN for the Portal API.
+central_init() {
+  CENTRAL_URL="${CENTRAL_URL%/}"
+  check_central_url "$CENTRAL_URL"
   AUTH_TOKEN=$(printf '%s:%s' "$CENTRAL_USERNAME" "$CENTRAL_TOKEN" | base64 -w0)
   echo "::add-mask::$AUTH_TOKEN"
 }
