@@ -14,7 +14,8 @@ Publish Maven artifacts to Maven Central via the [Central Portal REST API](https
 
 ## Features
 
-- GPG signs all artifacts (`.jar`, `.pom`, `.module`)
+- GPG signs every artifact in the bundle (`.jar`, `.pom`, `.module`, `.war`,
+  `.zip`, attached `.xml` files and so on)
 - Creates compliant bundle ZIP for Central Portal upload
 - Supports `AUTOMATIC` (auto-publish) and `USER_MANAGED` (validation) modes
 - Polls deployment status until completion
@@ -80,13 +81,19 @@ Maven Central requires a detached ASCII-armored `.asc` signature for every
 deployable artifact. The `signing-method` input controls how the action creates them:
 
 - **`gpg`** (default) — the action imports `gpg-private-key` and signs every
-  `*.jar`/`*.pom`/`*.module` (leaving files that already carry a `.asc` intact).
+  file the bundle carries other than checksums and signatures (leaving files
+  that already carry a `.asc` intact).
 - **`sigul`** — the caller MUST pre-sign the artifacts in a prior step (e.g.
   [`lfit/sigul-sign-action`](https://github.com/lfit/sigul-sign-action)). The
   action verifies that a `.asc` exists for every deployable artifact and
   fails if any is missing. `gpg-private-key` is not used.
 - **`none`** — no signing and no verification. Intended for `dry-run` or
   non-Central testing; Maven Central rejects an unsigned bundle.
+
+The bundle holds every file under `m2repo-path` except `maven-metadata.xml*`,
+`_remote.repositories`, `*.sha256` and `*.sha512`, at any depth, plus the
+`.md5` and `.sha1` checksums the action generates. Signing and the `sigul`
+check cover that same set, less checksums and `.asc` files.
 
 ## Outputs
 
@@ -124,8 +131,8 @@ The action generates `.asc` (GPG signature) for each file automatically.
 
 ```text
 1. Import GPG key from base64 secret
-2. Sign all .jar/.pom/.module files → .asc signatures
-3. Create bundle.zip (Maven directory structure, excludes checksums)
+2. Sign each bundled file (other than checksums) → .asc signatures
+3. Create bundle.zip (Maven directory structure, generated .md5/.sha1)
 4. POST bundle to Central Portal: /api/v1/publisher/upload
 5. Poll /api/v1/publisher/status until VALIDATED/PUBLISHED/FAILED
 ```

@@ -4,29 +4,31 @@
 
 # Create a detached ASCII-armoured signature for each deployable artifact.
 set -euo pipefail
+# shellcheck source=scripts/lib.sh
+. "$(dirname "$0")/lib.sh"
 
 M2REPO="$INPUT_M2REPO"
 SIGN_COUNT=0
+SKIP_COUNT=0
 
-# Sign all .jar and .pom files
-find "$M2REPO" -type f \( -name "*.jar" -o -name "*.pom" -o -name "*.module" \) | \
-while read -r file; do
-  if [ -f "${file}.asc" ]; then
-    echo "  Skip (already signed): $(basename "$file")"
+PASSPHRASE_ARGS=()
+if [ -n "$GPG_PASSPHRASE" ]; then
+  PASSPHRASE_ARGS=(--passphrase "$GPG_PASSPHRASE")
+fi
+
+# Sign every file the bundle carries, other than checksums and signatures
+while IFS= read -r file; do
+  if [ -f "$M2REPO/${file}.asc" ]; then
+    echo "  Skip (already signed): $file"
+    SKIP_COUNT=$((SKIP_COUNT + 1))
     continue
   fi
 
-  if [ -n "$GPG_PASSPHRASE" ]; then
-    gpg --batch --pinentry-mode loopback --passphrase "$GPG_PASSPHRASE" \
-      --local-user "$GPG_KEY_ID" --armor --detach-sign "$file"
-  else
-    gpg --batch --pinentry-mode loopback \
-      --local-user "$GPG_KEY_ID" --armor --detach-sign "$file"
-  fi
+  gpg --batch --pinentry-mode loopback "${PASSPHRASE_ARGS[@]}" \
+    --local-user "$GPG_KEY_ID" --armor --detach-sign "$M2REPO/$file"
 
   SIGN_COUNT=$((SIGN_COUNT + 1))
-done
+done < <(list_signable_files "$M2REPO")
 
-ASC_COUNT=$(find "$M2REPO" -name "*.asc" | wc -l)
-echo "Signed artifacts: $ASC_COUNT .asc files created"
-echo "sign-count=$ASC_COUNT" >> "$GITHUB_OUTPUT"
+echo "Signed artifacts: $SIGN_COUNT new, $SKIP_COUNT already signed"
+echo "sign-count=$((SIGN_COUNT + SKIP_COUNT))" >> "$GITHUB_OUTPUT"

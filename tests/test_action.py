@@ -208,7 +208,6 @@ class UploadTests(ScriptTestCase):
         self.assertNotIn("bundle_path", uploaded.outputs)
 
 
-@unittest.expectedFailure
 class FileSetTests(ScriptTestCase):
     """Sign, verify and bundle the same set of files."""
 
@@ -234,7 +233,8 @@ class FileSetTests(ScriptTestCase):
     def test_gpg_signs_every_artefact(self) -> None:
         """The gpg step signs attachments such as a WAR or a ZIP."""
         build_m2repo(self.m2repo)
-        home = Path(tempfile.mkdtemp(prefix="cpa-gpg-"))
+        # A short path: gpg-agent's socket must fit the platform's limit.
+        home = Path(tempfile.mkdtemp(prefix="cpa-gpg-", dir="/tmp"))
         self.addCleanup(shutil.rmtree, home, ignore_errors=True)
         gpg_env = {**os.environ, "GNUPGHOME": str(home)}
         self.addCleanup(

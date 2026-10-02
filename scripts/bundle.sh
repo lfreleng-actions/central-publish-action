@@ -4,29 +4,26 @@
 
 # Generate checksums and package the Maven repository as a Central bundle.
 set -euo pipefail
+# shellcheck source=scripts/lib.sh
+. "$(dirname "$0")/lib.sh"
 
 M2REPO="$INPUT_M2REPO"
 BUNDLE_DIR="${GITHUB_WORKSPACE}/central-bundle"
 BUNDLE_PATH="${BUNDLE_DIR}/bundle.zip"
 mkdir -p "$BUNDLE_DIR"
-
-# Bundle must contain artifacts in Maven directory structure
-# (relative paths from the repo root)
-cd "$M2REPO"
+rm -f "$BUNDLE_PATH"
 
 # Central Portal REQUIRES .md5 and .sha1 checksums for each artifact
 echo "Generating checksums..."
-find . -type f \
-  ! -name "*.md5" ! -name "*.sha1" ! -name "*.sha256" ! -name "*.sha512" \
-  ! -name "maven-metadata.xml*" ! -name "_remote.repositories" \
-  | while read -r file; do
-    md5sum "$file" | awk '{print $1}' > "${file}.md5"
-    sha1sum "$file" | awk '{print $1}' > "${file}.sha1"
-  done
+while IFS= read -r file; do
+  md5sum "$M2REPO/$file" | awk '{print $1}' > "$M2REPO/${file}.md5"
+  sha1sum "$M2REPO/$file" | awk '{print $1}' > "$M2REPO/${file}.sha1"
+done < <(list_payload_files "$M2REPO")
 
-zip -r "$BUNDLE_PATH" . \
-  -x "*.sha256" -x "*.sha512" \
-  -x "maven-metadata.xml*" -x "_remote.repositories"
+# Bundle must contain artifacts in Maven directory structure (relative
+# paths from the repo root). An explicit file list keeps the excluded
+# names out at every depth, which zip's -x patterns did not.
+list_bundle_files "$M2REPO" | (cd "$M2REPO" && zip "$BUNDLE_PATH" -@)
 
 BUNDLE_SIZE=$(stat -c%s "$BUNDLE_PATH" 2>/dev/null || stat -f%z "$BUNDLE_PATH")
 echo "Bundle created: $BUNDLE_PATH ($(numfmt --to=iec "$BUNDLE_SIZE"))"

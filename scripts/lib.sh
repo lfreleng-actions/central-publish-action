@@ -4,6 +4,28 @@
 
 # Functions shared by the action's steps; source this file, don't run it.
 
+# list_bundle_files DIR: print, relative to DIR and sorted, every file the
+# Central bundle carries. This is the one definition of that set: the
+# checksum, signing, signature-check and deployment-check steps all
+# derive theirs from it. Repository bookkeeping stays out at any depth.
+list_bundle_files() {
+  (cd "$1" && find . -type f \
+    ! -name 'maven-metadata.xml*' ! -name '_remote.repositories' \
+    ! -name '*.sha256' ! -name '*.sha512' -print) |
+    sed 's|^\./||' | LC_ALL=C sort
+}
+
+# list_payload_files DIR: the bundle minus the .md5/.sha1 sidecars the
+# bundle step generates; artefacts and their .asc signatures.
+list_payload_files() {
+  list_bundle_files "$1" | awk '!/\.(md5|sha1)$/'
+}
+
+# list_signable_files DIR: every payload file that needs a .asc beside it.
+list_signable_files() {
+  list_payload_files "$1" | awk '!/\.asc$/'
+}
+
 # Central Portal deployment IDs are UUIDs; anything else is refused before
 # it reaches a URL or GITHUB_OUTPUT.
 DEPLOYMENT_ID_RE='^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
