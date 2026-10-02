@@ -4,75 +4,32 @@
 
 # Poll the Central Portal until the uploaded deployment settles.
 set -euo pipefail
+# shellcheck source=scripts/lib.sh
+. "$(dirname "$0")/lib.sh"
 
-TIMEOUT="$INPUT_POLL_TIMEOUT"
-INTERVAL="$INPUT_POLL_INTERVAL"
+central_init
+require_deployment_id "$DEPLOYMENT_ID"
 
-AUTH_TOKEN=$(echo -n "${CENTRAL_USERNAME}:${CENTRAL_TOKEN}" | base64 -w0)
-echo "::add-mask::$AUTH_TOKEN"
+# USER_MANAGED stops at VALIDATED and waits for a person (or publish
+# mode) to release it; AUTOMATIC succeeds only once Central publishes.
+if [ "$INPUT_PUBLISHING_TYPE" = "USER_MANAGED" ]; then
+  TARGET="VALIDATED"
+else
+  TARGET="PUBLISHED"
+fi
 
-echo "Polling deployment status (timeout: ${TIMEOUT}s, interval: ${INTERVAL}s)..."
+RESULT=0
+poll_deployment "$DEPLOYMENT_ID" "$TARGET" || RESULT=1
+echo "deployment_status=$DEPLOYMENT_STATUS" >> "$GITHUB_OUTPUT"
 
-ELAPSED=0
-FINAL_STATUS="UNKNOWN"
-
-while [ "$ELAPSED" -lt "$TIMEOUT" ]; do
-  RESPONSE=$(curl -s -X POST \
-    "${CENTRAL_URL}/api/v1/publisher/status?id=${DEPLOYMENT_ID}" \
-    -H "Authorization: Bearer $AUTH_TOKEN" \
-    -H "Content-Type: application/json" \
-    -w "\n%{http_code}" \
-    2>&1)
-
-  HTTP_CODE=$(echo "$RESPONSE" | tail -1)
-  BODY=$(echo "$RESPONSE" | sed '$d')
-
-  if [ "$HTTP_CODE" != "200" ]; then
-    echo "  Poll request failed (HTTP $HTTP_CODE), retrying..."
-    sleep "$INTERVAL"
-    ELAPSED=$((ELAPSED + INTERVAL))
-    continue
+if [ "$RESULT" -ne 0 ]; then
+  if [ "$TARGET" = "PUBLISHED" ] && [ "$DEPLOYMENT_STATUS" = "VALIDATED" ]; then
+    echo "::error::AUTOMATIC deployment $DEPLOYMENT_ID passed validation but Central has not published it"
   fi
-
-  STATUS=$(echo "$BODY" | jq -r '.deploymentState // .state // "UNKNOWN"')
-  echo "  [$ELAPSED s] Status: $STATUS"
-
-  case "$STATUS" in
-    PUBLISHED)
-      FINAL_STATUS="PUBLISHED"
-      echo "✅ Deployment PUBLISHED successfully!"
-      break
-      ;;
-    VALIDATED)
-      FINAL_STATUS="VALIDATED"
-      if [ "$INPUT_PUBLISHING_TYPE" = "USER_MANAGED" ]; then
-        echo "✅ Deployment VALIDATED (USER_MANAGED — not auto-published)"
-        break
-      fi
-      echo "  Waiting for publication..."
-      ;;
-    FAILED)
-      FINAL_STATUS="FAILED"
-      echo "::error::Deployment FAILED"
-      echo "$BODY" | jq '.errors // .' 2>/dev/null || echo "$BODY"
-      exit 1
-      ;;
-    PENDING|VALIDATING|PUBLISHING)
-      # Still in progress
-      ;;
-    *)
-      echo "  Unknown status: $STATUS"
-      ;;
-  esac
-
-  sleep "$INTERVAL"
-  ELAPSED=$((ELAPSED + INTERVAL))
-done
-
-if [ "$ELAPSED" -ge "$TIMEOUT" ] && [ "$FINAL_STATUS" != "PUBLISHED" ] && \
-   [ "$FINAL_STATUS" != "VALIDATED" ]; then
-  echo "::error::Timed out waiting for deployment (last status: $FINAL_STATUS)"
   exit 1
 fi
 
-echo "deployment_status=$FINAL_STATUS" >> "$GITHUB_OUTPUT"
+case "$DEPLOYMENT_STATUS" in
+  PUBLISHED) echo "✅ Deployment PUBLISHED successfully!" ;;
+  VALIDATED) echo "✅ Deployment VALIDATED (USER_MANAGED — not auto-published)" ;;
+esac

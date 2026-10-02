@@ -137,7 +137,6 @@ class UploadTests(ScriptTestCase):
         self.assertEqual(polled.code, 0, polled.log)
         self.assertEqual(polled.outputs["deployment_status"], "PUBLISHED")
 
-    @unittest.expectedFailure
     def test_automatic_timeout_while_validated_fails(self) -> None:
         """AUTOMATIC must not pass when nothing reached Maven Central."""
         deployment = self.central.add({}, ["VALIDATING", "VALIDATED"])
@@ -145,14 +144,12 @@ class UploadTests(ScriptTestCase):
         self.assertNotEqual(polled.code, 0, polled.log)
         self.assertEqual(polled.outputs.get("deployment_status"), "VALIDATED")
 
-    @unittest.expectedFailure
     def test_automatic_timeout_while_publishing_fails(self) -> None:
         """A deployment stuck in PUBLISHING at the timeout fails."""
         deployment = self.central.add({}, ["VALIDATED", "PUBLISHING"])
         polled = self.poll(deployment.deployment_id, "AUTOMATIC", timeout="3")
         self.assertNotEqual(polled.code, 0, polled.log)
 
-    @unittest.expectedFailure
     def test_timeout_bounds_slow_status_requests(self) -> None:
         """poll-timeout is wall-clock time, request time included."""
         deployment = self.central.add({}, ["VALIDATING"])
@@ -162,7 +159,6 @@ class UploadTests(ScriptTestCase):
         self.assertNotEqual(polled.code, 0, polled.log)
         self.assertLess(time.monotonic() - started, 5)
 
-    @unittest.expectedFailure
     def test_timeout_bounds_the_last_sleep(self) -> None:
         """A poll-interval longer than the time left never overshoots."""
         deployment = self.central.add({}, ["VALIDATING"])

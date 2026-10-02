@@ -48,6 +48,11 @@ Publish Maven artifacts to Maven Central via the [Central Portal REST API](https
     publishing-type: AUTOMATIC
 ```
 
+With `AUTOMATIC`, the action succeeds once Central reports the deployment
+`PUBLISHED`; a deployment still `VALIDATED` or `PUBLISHING` when
+`poll-timeout` expires fails the step. Raise `poll-timeout` for large
+releases.
+
 ### Dry run (no upload)
 
 ```yaml

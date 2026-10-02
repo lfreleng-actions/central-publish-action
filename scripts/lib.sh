@@ -51,3 +51,72 @@ central_init() {
   AUTH_TOKEN=$(printf '%s:%s' "$CENTRAL_USERNAME" "$CENTRAL_TOKEN" | base64 -w0)
   echo "::add-mask::$AUTH_TOKEN"
 }
+
+# central_status ID [MAX_SECONDS]: read the deployment's status once,
+# giving up after MAX_SECONDS (default and ceiling 120). Sets STATUS_BODY
+# to the reply and DEPLOYMENT_STATUS to its state; returns 1 on an HTTP
+# error, leaving DEPLOYMENT_STATUS unchanged.
+central_status() {
+  local reply http max_time="${2:-120}"
+  [ "$max_time" -le 120 ] || max_time=120
+  reply=$(mktemp)
+  http=$(curl -sS -X POST -o "$reply" -w '%{http_code}' \
+    --connect-timeout 30 --max-time "$max_time" \
+    "${CENTRAL_URL}/api/v1/publisher/status?id=$1" \
+    -H "Authorization: Bearer $AUTH_TOKEN") || http="000"
+  STATUS_BODY=$(cat "$reply")
+  rm -f "$reply"
+  if [ "$http" != "200" ]; then
+    echo "  Status request failed (HTTP $http)"
+    return 1
+  fi
+  DEPLOYMENT_STATUS=$(jq -r '.deploymentState // .state // "UNKNOWN"' \
+    <<< "$STATUS_BODY" 2>/dev/null) || DEPLOYMENT_STATUS="UNKNOWN"
+  # The state lands in GITHUB_OUTPUT, so it must be one plain word
+  [[ "$DEPLOYMENT_STATUS" =~ ^[A-Z_]{1,32}$ ]] || DEPLOYMENT_STATUS="UNKNOWN"
+}
+
+# poll_deployment ID TARGET: read the status every INPUT_POLL_INTERVAL
+# seconds for up to INPUT_POLL_TIMEOUT seconds, until TARGET holds:
+#   VALIDATED  the deployment is VALIDATED or PUBLISHED
+#   PUBLISHED  the deployment is PUBLISHED
+#   SETTLED    the deployment has left PENDING and VALIDATING
+# FAILED and the timeout return 1. The timeout is wall-clock time: each
+# request and sleep gets no more than the time left. DEPLOYMENT_STATUS
+# holds the last state seen, or UNKNOWN when no read succeeded.
+poll_deployment() {
+  local id="$1" target="$2" start remaining
+  local timeout="$INPUT_POLL_TIMEOUT" interval="$INPUT_POLL_INTERVAL"
+  start=$(date +%s)
+  DEPLOYMENT_STATUS="UNKNOWN"
+  echo "Polling deployment status (until $target, timeout: ${timeout}s, interval: ${interval}s)..."
+  while remaining=$((start + timeout - $(date +%s))); [ "$remaining" -gt 0 ]; do
+    if central_status "$id" "$remaining"; then
+      echo "  [$(($(date +%s) - start))s] Status: $DEPLOYMENT_STATUS"
+      case "$DEPLOYMENT_STATUS" in
+        PUBLISHED)
+          return 0
+          ;;
+        FAILED)
+          echo "::error::Deployment $id FAILED"
+          jq '.errors // .' <<< "$STATUS_BODY" 2>/dev/null || echo "$STATUS_BODY"
+          return 1
+          ;;
+        VALIDATED)
+          [ "$target" = "PUBLISHED" ] || return 0
+          ;;
+        PENDING|VALIDATING)
+          ;;
+        *)
+          # PUBLISHING, or a state this action does not know
+          [ "$target" != "SETTLED" ] || return 0
+          ;;
+      esac
+    fi
+    remaining=$((start + timeout - $(date +%s)))
+    [ "$remaining" -gt 0 ] || break
+    sleep "$((remaining < interval ? remaining : interval))"
+  done
+  echo "::error::Timed out after ${timeout}s waiting for deployment $id to reach $target (last status: $DEPLOYMENT_STATUS)"
+  return 1
+}
