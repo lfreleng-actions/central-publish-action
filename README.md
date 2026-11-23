@@ -67,6 +67,10 @@ releases.
     dry-run: "true"
 ```
 
+`dry-run` must be `true` or `false`. Any other value, including an empty
+string, `TRUE` or a stray space, fails input validation, before any
+signing, upload or publication.
+
 ### Stage now, release later (`mode: publish`)
 
 A release lane can upload in the default `USER_MANAGED` mode at stage time,
@@ -137,7 +141,7 @@ publishing.
 | `gpg-private-key`   | cond.    | —                              | GPG private key (base64-encoded armor); required when `signing-method=gpg`          |
 | `gpg-passphrase`    | no       | _(empty)_                      | GPG key passphrase                                                                  |
 | `publishing-type`   | no       | `USER_MANAGED`                 | Upload mode: `AUTOMATIC` or `USER_MANAGED`                                          |
-| `dry-run`           | no       | `false`                        | Upload mode: create the bundle, skip upload. Publish mode: check, skip publishing   |
+| `dry-run`           | no       | `false`                        | `true` or `false`; `true` skips upload (upload mode) or publishing (publish mode)   |
 | `poll-timeout`      | no       | `600`                          | Max seconds to wait for each phase (validation, then publication)                   |
 | `poll-interval`     | no       | `15`                           | Seconds between status polls                                                        |
 

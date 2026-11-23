@@ -443,7 +443,6 @@ class PublishTests(ScriptTestCase):
         self.assertEqual(run.outputs["verified_file_count"], str(2 * len(ARTEFACTS)))
         self.assertEqual(deployment.publish_calls, 0)
 
-    @unittest.expectedFailure
     def test_malformed_dry_run_never_publishes(self) -> None:
         """A dry-run value other than true or false fails unpublished."""
         deployment = self.stage(["VALIDATED"])
@@ -509,7 +508,6 @@ class ValidateTests(ScriptTestCase):
                 run = self.validate(**env)
                 self.assertNotEqual(run.code, 0, run.log)
 
-    @unittest.expectedFailure
     def test_dry_run_emits_the_canonical_value(self) -> None:
         """dry-run true and false pass and reach the step outputs."""
         for value in ("true", "false"):
@@ -518,7 +516,6 @@ class ValidateTests(ScriptTestCase):
                 self.assertEqual(run.code, 0, run.log)
                 self.assertEqual(run.outputs.get("dry-run"), value)
 
-    @unittest.expectedFailure
     def test_rejects_malformed_dry_run(self) -> None:
         """Any other dry-run value fails and names the value received."""
         for value in MALFORMED_DRY_RUN:
@@ -528,7 +525,6 @@ class ValidateTests(ScriptTestCase):
                 self.assertIn(f"::error::dry-run '{value}'", run.log)
                 self.assertNotIn("dry-run", run.outputs)
 
-    @unittest.expectedFailure
     def test_steps_read_only_the_validated_dry_run(self) -> None:
         """Only the validate step reads the raw dry-run input."""
         action = (ROOT / "action.yaml").read_text()
@@ -548,7 +544,6 @@ class ValidateTests(ScriptTestCase):
             with self.subTest(step=name):
                 self.assertIn(text, steps.get(name, ""))
 
-    @unittest.expectedFailure
     def test_validate_step_runs_every_check(self) -> None:
         """The validate step's own run block gates and emits dry-run."""
         build_m2repo(self.m2repo)
