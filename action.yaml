@@ -75,8 +75,9 @@ inputs:
     default: "USER_MANAGED"
   dry-run:
     description: >-
-      If true: upload mode creates the bundle but skips the upload; publish
-      mode checks the deployment but does not publish it.
+      'true' or 'false'. If true: upload mode creates the bundle but skips
+      the upload; publish mode checks the deployment but does not publish
+      it. Any other value fails the run before signing or network access.
     required: false
     default: "false"
   poll-timeout:
@@ -116,6 +117,7 @@ runs:
         INPUT_MODE: "${{ inputs.mode }}"
         INPUT_DEPLOYMENT_ID: "${{ inputs.deployment-id }}"
         INPUT_SKIP_VERIFICATION: "${{ inputs.skip-verification }}"
+        INPUT_DRY_RUN: "${{ inputs.dry-run }}"
         INPUT_M2REPO: "${{ inputs.m2repo-path }}"
         INPUT_CENTRAL_URL: "${{ inputs.central-url }}"
         INPUT_SIGNING_METHOD: "${{ inputs.signing-method }}"
@@ -123,7 +125,12 @@ runs:
         INPUT_PUBLISHING_TYPE: "${{ inputs.publishing-type }}"
         INPUT_POLL_TIMEOUT: "${{ inputs.poll-timeout }}"
         INPUT_POLL_INTERVAL: "${{ inputs.poll-interval }}"
-      run: bash "${GITHUB_ACTION_PATH}/scripts/validate.sh"
+      # Run both checks so one run reports every invalid input.
+      run: |
+        status=0
+        bash "${GITHUB_ACTION_PATH}/scripts/validate.sh" || status=1
+        bash "${GITHUB_ACTION_PATH}/scripts/validate-dry-run.sh" || status=1
+        exit "$status"
 
     - name: Import GPG key
       id: gpg
@@ -179,7 +186,7 @@ runs:
 
     - name: Upload bundle to Central Portal
       id: upload
-      if: inputs.mode != 'publish' && inputs.dry-run != 'true'
+      if: inputs.mode != 'publish' && steps.validate.outputs.dry-run == 'false'
       shell: bash
       env:
         CENTRAL_USERNAME: "${{ inputs.central-username }}"
@@ -191,7 +198,7 @@ runs:
 
     - name: Poll deployment status
       id: poll
-      if: inputs.mode != 'publish' && inputs.dry-run != 'true'
+      if: inputs.mode != 'publish' && steps.validate.outputs.dry-run == 'false'
       shell: bash
       env:
         CENTRAL_USERNAME: "${{ inputs.central-username }}"
@@ -214,7 +221,7 @@ runs:
         INPUT_DEPLOYMENT_ID: "${{ inputs.deployment-id }}"
         INPUT_M2REPO: "${{ inputs.m2repo-path }}"
         INPUT_SKIP_VERIFICATION: "${{ inputs.skip-verification }}"
-        INPUT_DRY_RUN: "${{ inputs.dry-run }}"
+        INPUT_DRY_RUN: "${{ steps.validate.outputs.dry-run }}"
         INPUT_POLL_TIMEOUT: "${{ inputs.poll-timeout }}"
         INPUT_POLL_INTERVAL: "${{ inputs.poll-interval }}"
       run: bash "${GITHUB_ACTION_PATH}/scripts/publish.sh"
@@ -226,7 +233,7 @@ runs:
         INPUT_MODE: "${{ inputs.mode }}"
         INPUT_SIGNING_METHOD: "${{ inputs.signing-method }}"
         INPUT_PUBLISHING_TYPE: "${{ inputs.publishing-type }}"
-        INPUT_DRY_RUN: "${{ inputs.dry-run }}"
+        INPUT_DRY_RUN: "${{ steps.validate.outputs.dry-run || 'N/A' }}"
         SIGN_COUNT: "${{ steps.sign.outputs.sign-count || steps.verify-sign.outputs.sign-count || 'N/A' }}"
         ARTIFACT_COUNT: "${{ steps.validate.outputs.artifact-count }}"
         BUNDLE_SIZE: "${{ steps.bundle.outputs.bundle-size }}"

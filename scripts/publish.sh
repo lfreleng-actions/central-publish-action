@@ -13,6 +13,13 @@ M2REPO="$INPUT_M2REPO"
 DEPLOYMENT_STATUS="UNKNOWN"
 VERIFIED=0
 
+case "${INPUT_DRY_RUN-}" in
+  true|false) ;;
+  *)
+    echo "::error::dry-run '${INPUT_DRY_RUN-}' must be 'true' or 'false'"
+    exit 1
+    ;;
+esac
 require_deployment_id "$DEPLOYMENT_ID"
 central_init
 echo "deployment_id=$DEPLOYMENT_ID" >> "$GITHUB_OUTPUT"

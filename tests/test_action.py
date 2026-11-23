@@ -24,6 +24,7 @@ from .mock_central import Deployment, MockCentral, read_bundle
 
 ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS = ROOT / "scripts"
+MALFORMED_DRY_RUN = ["TRUE", " true", "ttrue", "yes", "1", ""]
 WAR = f"org/example/demo/{VERSION}/demo-{VERSION}.war"
 
 
@@ -58,6 +59,10 @@ class ScriptTestCase(unittest.TestCase):
 
     def run_script(self, name: str, **env: str) -> Run:
         """Run ``scripts/<name>`` with the action's environment plus ``env``."""
+        return self.run_bash([str(SCRIPTS / name)], **env)
+
+    def run_bash(self, args: list[str], **env: str) -> Run:
+        """Run ``bash args`` with the action's environment plus ``env``."""
         output = self.tmp / "github_output"
         _ = output.write_text("")
         full = {
@@ -73,7 +78,7 @@ class ScriptTestCase(unittest.TestCase):
             **env,
         }
         proc = subprocess.run(
-            ["bash", str(SCRIPTS / name)],
+            ["bash", *args],
             env=full,
             capture_output=True,
             text=True,
@@ -438,6 +443,14 @@ class PublishTests(ScriptTestCase):
         self.assertEqual(run.outputs["verified_file_count"], str(2 * len(ARTEFACTS)))
         self.assertEqual(deployment.publish_calls, 0)
 
+    def test_malformed_dry_run_never_publishes(self) -> None:
+        """A dry-run value other than true or false fails unpublished."""
+        deployment = self.stage(["VALIDATED"])
+        for value in MALFORMED_DRY_RUN:
+            with self.subTest(value=value):
+                run = self.publish(deployment, INPUT_DRY_RUN=value)
+                self.assert_fails_unpublished(run, deployment, "dry-run")
+
 
 class ValidateTests(ScriptTestCase):
     """Reject inconsistent inputs before any work starts."""
@@ -494,3 +507,108 @@ class ValidateTests(ScriptTestCase):
             with self.subTest(env=env):
                 run = self.validate(**env)
                 self.assertNotEqual(run.code, 0, run.log)
+
+    def test_dry_run_emits_the_canonical_value(self) -> None:
+        """dry-run true and false pass and reach the step outputs."""
+        for value in ("true", "false"):
+            with self.subTest(value=value):
+                run = self.run_script("validate-dry-run.sh", INPUT_DRY_RUN=value)
+                self.assertEqual(run.code, 0, run.log)
+                self.assertEqual(run.outputs.get("dry-run"), value)
+
+    def test_rejects_malformed_dry_run(self) -> None:
+        """Any other dry-run value fails and names the value received."""
+        for value in MALFORMED_DRY_RUN:
+            with self.subTest(value=value):
+                run = self.run_script("validate-dry-run.sh", INPUT_DRY_RUN=value)
+                self.assertNotEqual(run.code, 0, run.log)
+                self.assertIn(f"::error::dry-run '{value}'", run.log)
+                self.assertNotIn("dry-run", run.outputs)
+
+    def test_steps_read_only_the_validated_dry_run(self) -> None:
+        """Only the validate step reads the raw dry-run input."""
+        action = (ROOT / "action.yaml").read_text()
+        self.assertEqual(action.count("inputs.dry-run"), 1)
+        self.assertIn('INPUT_DRY_RUN: "${{ inputs.dry-run }}"', action)
+        steps = action_steps(action)
+        output = "steps.validate.outputs.dry-run"
+        guard = f"if: inputs.mode != 'publish' && {output} == 'false'"
+        validated = f'INPUT_DRY_RUN: "${{{{ {output}'
+        expected = {
+            "Upload bundle to Central Portal": guard,
+            "Poll deployment status": guard,
+            "Publish deployment": validated,
+            "Generate summary": validated,
+        }
+        for name, text in expected.items():
+            with self.subTest(step=name):
+                self.assertIn(text, steps.get(name, ""))
+
+    def test_validate_step_runs_every_check(self) -> None:
+        """The validate step's own run block gates and emits dry-run."""
+        build_m2repo(self.m2repo)
+        cases = [
+            ({"INPUT_DRY_RUN": "true"}, "true"),
+            ({"INPUT_DRY_RUN": "false"}, "false"),
+            ({"INPUT_DRY_RUN": "ttrue"}, None),
+            ({"INPUT_DRY_RUN": "true", "INPUT_MODE": "bogus"}, None),
+        ]
+        for env, dry_run in cases:
+            with self.subTest(env=env):
+                run = self.validate_step(**env)
+                if dry_run is None:
+                    self.assertNotEqual(run.code, 0, run.log)
+                    if env["INPUT_DRY_RUN"] not in ("true", "false"):
+                        self.assertNotIn("dry-run", run.outputs)
+                else:
+                    self.assertEqual(run.code, 0, run.log)
+                    self.assertEqual(run.outputs.get("dry-run"), dry_run)
+                    self.assertIn("artifact-count", run.outputs)
+        run = self.validate_step(INPUT_DRY_RUN="", INPUT_MODE="bogus")
+        self.assertNotEqual(run.code, 0, run.log)
+        self.assertIn("::error::Invalid mode 'bogus'", run.log)
+        self.assertIn("::error::dry-run ''", run.log)
+
+    def validate_step(self, **env: str) -> Run:
+        """Run the Validate inputs step's run block from action.yaml."""
+        action = (ROOT / "action.yaml").read_text()
+        script = self.tmp / "validate-step.sh"
+        _ = script.write_text(step_run(action_steps(action)["Validate inputs"]))
+        settings = {
+            "INPUT_MODE": "upload",
+            "INPUT_SIGNING_METHOD": "none",
+            "INPUT_GPG_KEY_PROVIDED": "false",
+            "INPUT_PUBLISHING_TYPE": "USER_MANAGED",
+            "INPUT_DEPLOYMENT_ID": "",
+            "INPUT_SKIP_VERIFICATION": "false",
+            "INPUT_CENTRAL_URL": "https://central.sonatype.com",
+            "GITHUB_ACTION_PATH": str(ROOT),
+            **env,
+        }
+        args = ["--noprofile", "--norc", "-eo", "pipefail", str(script)]
+        return self.run_bash(args, **settings)
+
+
+def step_run(body: str) -> str:
+    """Return a step's run script, as either a scalar or a block."""
+    lines = body.split("\n")
+    for i, line in enumerate(lines):
+        if line.startswith("      run: |"):
+            block: list[str] = []
+            for rest in lines[i + 1 :]:
+                if rest.strip() and not rest.startswith(" " * 8):
+                    break
+                block.append(rest[8:])
+            return "\n".join(block).strip() + "\n"
+        if line.startswith("      run: "):
+            return line.removeprefix("      run: ") + "\n"
+    raise ValueError("step has no run key")
+
+
+def action_steps(action: str) -> dict[str, str]:
+    """Split action.yaml's composite steps into their text, keyed by name."""
+    steps: dict[str, str] = {}
+    for block in action.split("\n    - name: ")[1:]:
+        name, _, body = block.partition("\n")
+        steps[name.strip()] = body
+    return steps
