@@ -9,6 +9,8 @@ signing test also needs gpg.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import shutil
 import subprocess
@@ -26,6 +28,7 @@ ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS = ROOT / "scripts"
 MALFORMED_DRY_RUN = ["TRUE", " true", "ttrue", "yes", "1", ""]
 WAR = f"org/example/demo/{VERSION}/demo-{VERSION}.war"
+MANIFEST = "central-deployment.json"
 
 
 @dataclass
@@ -91,12 +94,20 @@ class ScriptTestCase(unittest.TestCase):
             outputs[key] = value
         return Run(proc.returncode, proc.stdout + proc.stderr, outputs)
 
-    def bundle(self) -> dict[str, bytes]:
-        """Bundle the signed fixture repository and return its files."""
+    def bundle(self, extra: tuple[str, ...] = ()) -> dict[str, bytes]:
+        """Bundle the signed fixture, plus ``extra`` artefacts, and return its files."""
         build_m2repo(self.m2repo, signed=True)
+        for relative in extra:
+            path = self.m2repo / relative
+            _ = path.write_bytes(f"content of {relative}\n".encode())
+            _ = path.with_name(path.name + ".asc").write_bytes(b"signature\n")
         run = self.run_script("bundle.sh")
         self.assertEqual(run.code, 0, run.log)
         return read_bundle(Path(run.outputs["bundle_path"]).read_bytes())
+
+    def record(self, deployment_id: str) -> Run:
+        """Record the upload manifest for ``deployment_id`` in the m2repo."""
+        return self.run_script("record-deployment.sh", DEPLOYMENT_ID=deployment_id)
 
 
 class UploadTests(ScriptTestCase):
@@ -208,6 +219,29 @@ class UploadTests(ScriptTestCase):
         self.assertNotEqual(uploaded.code, 0, uploaded.log)
         self.assertNotIn("bundle_path", uploaded.outputs)
 
+    @unittest.expectedFailure
+    def test_records_the_uploaded_files(self) -> None:
+        """The manifest names the deployment and digests each file it holds."""
+        uploaded = self.upload("USER_MANAGED")
+        self.assertEqual(uploaded.code, 0, uploaded.log)
+        deployment_id = uploaded.outputs["deployment_id"]
+        recorded = self.record(deployment_id)
+        self.assertEqual(recorded.code, 0, recorded.log)
+        self.assertEqual(recorded.outputs["manifest_path"], str(self.m2repo / MANIFEST))
+        files = self.central.deployments[deployment_id].files
+        self.assertEqual(
+            json.loads((self.m2repo / MANIFEST).read_text()),
+            {
+                "deploymentId": deployment_id,
+                "files": {
+                    path: hashlib.sha256(data).hexdigest()
+                    for path, data in files.items()
+                },
+            },
+        )
+        rebundled = self.bundle()
+        self.assertNotIn(MANIFEST, rebundled)
+
 
 class FileSetTests(ScriptTestCase):
     """Sign, verify and bundle the same set of files."""
@@ -291,6 +325,20 @@ class PublishTests(ScriptTestCase):
     def stage(self, states: list[str]) -> Deployment:
         """Register a deployment holding the fixture's bundle."""
         return self.central.add(self.bundle(), states)
+
+    def stage_recorded(
+        self, states: list[str], extra: tuple[str, ...] = ()
+    ) -> Deployment:
+        """Stage the fixture plus ``extra`` and record its manifest, as upload mode does."""
+        deployment = self.central.add(self.bundle(extra), states)
+        recorded = self.record(deployment.deployment_id)
+        self.assertEqual(recorded.code, 0, recorded.log)
+        return deployment
+
+    def remove_locally(self, relative: str) -> None:
+        """Delete ``relative`` and the sidecars the bundle step left beside it."""
+        for suffix in ("", ".md5", ".sha1"):
+            (self.m2repo / f"{relative}{suffix}").unlink(missing_ok=True)
 
     def publish(self, deployment: Deployment | str, **env: str) -> Run:
         """Run publish mode against ``deployment``."""
@@ -450,6 +498,96 @@ class PublishTests(ScriptTestCase):
             with self.subTest(value=value):
                 run = self.publish(deployment, INPUT_DRY_RUN=value)
                 self.assert_fails_unpublished(run, deployment, "dry-run")
+
+    @unittest.expectedFailure
+    def test_publishes_an_exact_match(self) -> None:
+        """Every bundle file, sidecars included, matches and gets published."""
+        deployment = self.stage_recorded(["VALIDATED"])
+        run = self.publish(deployment)
+        self.assertEqual(run.code, 0, run.log)
+        self.assertEqual(run.outputs["verified_file_count"], str(len(deployment.files)))
+        self.assertEqual(len(deployment.files), 6 * len(ARTEFACTS))
+        self.assertEqual(deployment.publish_calls, 1)
+
+    @unittest.expectedFailure
+    def test_dry_run_verifies_an_exact_match(self) -> None:
+        """dry-run checks every bundle file and leaves the deployment alone."""
+        deployment = self.stage_recorded(["VALIDATED"])
+        run = self.publish(deployment, INPUT_DRY_RUN="true")
+        self.assertEqual(run.code, 0, run.log)
+        self.assertEqual(run.outputs["deployment_status"], "VALIDATED")
+        self.assertEqual(run.outputs["verified_file_count"], str(len(deployment.files)))
+        self.assertEqual(deployment.publish_calls, 0)
+
+    def assert_remote_only_fails(self, relative: str) -> None:
+        """A file staged with the deployment but absent locally blocks it."""
+        deployment = self.stage_recorded(["VALIDATED"], extra=(relative,))
+        self.remove_locally(relative)
+        self.remove_locally(f"{relative}.asc")
+        self.assert_fails_unpublished(self.publish(deployment), deployment, relative)
+
+    @unittest.expectedFailure
+    def test_remote_only_file_fails(self) -> None:
+        """A remote-only file of an existing component blocks publication."""
+        self.assert_remote_only_fails(
+            f"org/example/demo/{VERSION}/demo-{VERSION}-extra.jar"
+        )
+
+    @unittest.expectedFailure
+    def test_remote_only_attachment_fails(self) -> None:
+        """A remote-only attachment of another type blocks publication."""
+        self.assert_remote_only_fails(
+            f"org/example/demo/{VERSION}/demo-{VERSION}.module"
+        )
+
+    @unittest.expectedFailure
+    def test_file_missing_locally_fails(self) -> None:
+        """A file the restored m2repo lacks blocks publication."""
+        deployment = self.stage_recorded(["VALIDATED"])
+        self.remove_locally(WAR)
+        self.remove_locally(f"{WAR}.asc")
+        self.assert_fails_unpublished(self.publish(deployment), deployment, WAR)
+
+    @unittest.expectedFailure
+    def test_signature_missing_locally_fails(self) -> None:
+        """A signature the restored m2repo lacks blocks publication."""
+        deployment = self.stage_recorded(["VALIDATED"])
+        self.remove_locally(f"{WAR}.asc")
+        self.assert_fails_unpublished(
+            self.publish(deployment), deployment, f"{WAR}.asc"
+        )
+
+    @unittest.expectedFailure
+    def test_sidecar_mismatch_fails(self) -> None:
+        """A checksum sidecar that differs from the m2repo's blocks publication."""
+        deployment = self.stage_recorded(["VALIDATED"])
+        deployment.files[f"{WAR}.md5"] = b"0\n"
+        self.assert_fails_unpublished(
+            self.publish(deployment), deployment, f"{WAR}.md5"
+        )
+
+    @unittest.expectedFailure
+    def test_other_deployment_fails(self) -> None:
+        """A deployment-id other than the recorded one blocks publication."""
+        recorded = self.stage_recorded(["VALIDATED"])
+        other = self.central.add(dict(recorded.files), ["VALIDATED"])
+        run = self.publish(other)
+        self.assert_fails_unpublished(run, other, recorded.deployment_id)
+        self.assertEqual(recorded.publish_calls, 0)
+
+    @unittest.expectedFailure
+    def test_requires_the_upload_manifest(self) -> None:
+        """Without the manifest upload mode records, nothing publishes."""
+        deployment = self.stage_recorded(["VALIDATED"])
+        (self.m2repo / MANIFEST).unlink()
+        self.assert_fails_unpublished(self.publish(deployment), deployment, MANIFEST)
+
+    @unittest.expectedFailure
+    def test_rerun_checks_the_manifest(self) -> None:
+        """A PUBLISHED deployment no longer matching the m2repo fails the re-run."""
+        deployment = self.stage_recorded(["PUBLISHED"])
+        self.remove_locally(WAR)
+        self.assert_fails_unpublished(self.publish(deployment), deployment, WAR)
 
 
 class ValidateTests(ScriptTestCase):
