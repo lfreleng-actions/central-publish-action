@@ -21,7 +21,7 @@ Publish Maven artifacts to Maven Central via the [Central Portal REST API](https
 - Polls deployment status until completion
 - `dry-run` mode for local testing (creates bundle, skips upload)
 - `publish` mode: releases a deployment staged earlier, by ID, after
-  checking it still holds the staged files
+  checking it holds the staged files and nothing else
 - Generates `$GITHUB_STEP_SUMMARY` with results
 
 ## Usage
@@ -75,7 +75,8 @@ signing, upload or publication.
 
 A release lane can upload in the default `USER_MANAGED` mode at stage time,
 record `deployment_id`, keep the signed m2repo, and publish that deployment
-weeks later:
+weeks later. Save the m2repo after the upload step, so it holds the upload
+manifest (see below):
 
 ```yaml
 # Release workflow
@@ -83,7 +84,7 @@ weeks later:
   with:
     mode: publish
     deployment-id: ${{ needs.load-stage-record.outputs.deployment-id }}
-    m2repo-path: m2repo # the signed m2repo saved at stage time
+    m2repo-path: m2repo # saved after upload, with central-deployment.json
     central-username: ${{ secrets.CENTRAL_USERNAME }}
     central-token: ${{ secrets.CENTRAL_TOKEN }}
 ```
@@ -95,34 +96,69 @@ then acts on the state:
 | State                     | Action                                                                                   |
 | ------------------------- | ---------------------------------------------------------------------------------------- |
 | `VALIDATED`               | Check the deployment against `m2repo-path`, publish it, wait for `PUBLISHED`             |
-| `PUBLISHING`, `PUBLISHED` | Check its components, skip the file check, wait for `PUBLISHED`; no second publish call  |
+| `PUBLISHING`, `PUBLISHED` | Check manifest and components, skip downloads, wait for `PUBLISHED`; no second publish   |
 | `FAILED`                  | Fail, printing the Portal's errors                                                       |
 | `PENDING`, `VALIDATING`   | Fail once `poll-timeout` expires                                                         |
 | Any other state           | Fail                                                                                     |
 
 The check stops a stale or mistyped `deployment-id` from releasing the wrong
-artifacts. Before publishing, the action:
+artifacts. Publish mode publishes when the deployment, its upload
+manifest and `m2repo-path` hold the same set of files with the same
+bytes, and never otherwise. A file missing from either side, an extra file on either side or a
+digest mismatch fails the run before any publish request.
 
+#### The upload manifest
+
+This action takes a deployment's complete file inventory from a
+manifest it records at upload time, rather than from the Portal. It
+then fetches each recorded file through the Portal's
+[download endpoint](https://central.sonatype.org/publish/publish-portal-api/#manually-testing-a-deployment-bundle)
+by path and compares its digest. Once an upload succeeds, upload mode writes
+`central-deployment.json` at the root of `m2repo-path` (output
+`manifest_path`). It records the deployment ID the Portal returned and the
+SHA-256 of every file the uploaded bundle held, `.md5`/`.sha1` sidecars
+included, read from the uploaded ZIP rather than from `m2repo-path`, which
+may have changed since bundling. Bundles never include the manifest. Before publishing, the action:
+
+- fails unless the manifest exists and records this `deployment-id`;
+- fails unless the manifest lists the same set of files a bundle built
+  from `m2repo-path` would carry, with the same SHA-256 each: every
+  artifact and `.asc` signature unchanged, and the `.md5`/`.sha1` sidecars
+  as the bundle step generates them from those files. Publish mode derives the sidecars
+  rather than reading them, as `m2repo-path` may hold stale ones or none.
+  Each sidecar holds the bare hex digest of its file's bytes, so restoring
+  the m2repo under a different path does not change it.
+  An orphan `.md5` or `.sha1` file, one with no artifact or signature
+  beside it, travels in the bundle unchanged, so publish mode counts it
+  with its own SHA-256;
 - compares the deployment's `purls` with the components in `m2repo-path`
   (one per POM, from the `group/artifactId/version` layout) and fails on any
   component missing from either side;
-- downloads every artifact and `.asc` signature the bundle carried from the
-  Portal's
-  [deployment download endpoint](https://central.sonatype.org/publish/publish-portal-api/#manually-testing-a-deployment-bundle)
-  and fails unless each SHA-256 matches the m2repo copy. It leaves out the
-  `.md5`/`.sha1` sidecars: the action generates them from those same files,
-  and Central checks them during validation.
+- downloads every one of those files, sidecars included, from the
+  deployment and fails unless each SHA-256 matches.
 
-The Portal documents that endpoint for validated deployments awaiting
-publication. A re-run that finds the deployment already `PUBLISHING` or
-`PUBLISHED` skips the file check, says so in the log, and relies on
-the run that published it, which checked first. Re-running a release is safe:
-it never publishes twice, and it succeeds once the deployment is `PUBLISHED`.
+**Trust model.** The download check proves the deployment holds every
+expected file with the expected bytes. The manifest is what rules out
+extra files: a Portal deployment holds the one bundle uploaded to create it, and
+the manifest records that bundle's contents under the ID the upload
+returned. The guarantee rests on the manifest being the one upload mode
+wrote, and the manifest is as trustworthy as the store the caller
+restores `m2repo-path` from; anyone who can alter the saved m2repo can alter both.
+The manifest has a name that does not start with a dot, so
+`actions/upload-artifact`, which skips hidden files by default, keeps it.
 
-Publish mode needs `m2repo-path` to exist. Setting `skip-verification: true`
-publishes without any check and logs a warning; keep it for emergencies.
-With `dry-run: true`, publish mode runs the checks and stops before
-publishing.
+The Portal documents its download endpoint for validated deployments
+awaiting publication. A re-run that finds the deployment already
+`PUBLISHING` or `PUBLISHED` checks the manifest and components, skips the
+downloads, says so in the log, and relies on the run that published it,
+which downloaded every file first. Re-running a release is safe: it never
+publishes twice, and it succeeds once the deployment is `PUBLISHED`.
+
+Publish mode needs `m2repo-path` to exist and to hold the upload manifest;
+a deployment staged without one fails the check. Setting
+`skip-verification: true` publishes without any check and logs a warning;
+keep it for emergencies. With `dry-run: true`, publish mode runs the checks
+and stops before publishing.
 
 ## Inputs
 
@@ -133,7 +169,7 @@ publishing.
 | `mode`              | no       | `upload`                       | `upload` (sign, bundle, upload) or `publish` (release an existing deployment)       |
 | `deployment-id`     | cond.    | _(empty)_                      | Deployment to publish; required with `mode: publish`, rejected in upload mode       |
 | `skip-verification` | no       | `false`                        | Publish mode: `true` publishes without checking against `m2repo-path`               |
-| `m2repo-path`       | yes      | `m2repo`                       | Path to local Maven repo directory; in publish mode, the signed m2repo staged       |
+| `m2repo-path`       | yes      | `m2repo`                       | Path to local Maven repo directory; in publish mode, the m2repo saved after upload  |
 | `central-username`  | yes      | —                              | Central Portal token username                                                       |
 | `central-token`     | yes      | —                              | Central Portal token password                                                       |
 | `central-url`       | no       | `https://central.sonatype.com` | Portal base URL: `https://host[:port]`, or loopback `http` for a test mock          |
@@ -173,8 +209,9 @@ check cover that same set, less checksums and `.asc` files.
 | --------------------- | --------------------------------------------------------------------------- |
 | `deployment_id`       | Central Portal deployment ID                                                |
 | `deployment_status`   | Last state seen: `VALIDATED`, `PUBLISHING`, `PUBLISHED`, `FAILED`, …        |
-| `verified_file_count` | Publish mode: files whose SHA-256 matched `m2repo-path` (0 if not checked)  |
+| `verified_file_count` | Publish mode: downloaded files whose SHA-256 matched (0 if not checked)     |
 | `bundle_path`         | Path to the created bundle ZIP (upload mode)                                |
+| `manifest_path`       | Upload manifest written into `m2repo-path` after a successful upload        |
 
 ## Requirements
 
@@ -207,14 +244,16 @@ The action generates `.asc` (GPG signature) for each file automatically.
 2. Sign each bundled file (other than checksums) → .asc signatures
 3. Create bundle.zip (Maven directory structure, generated .md5/.sha1)
 4. POST bundle to Central Portal: /api/v1/publisher/upload
-5. Poll /api/v1/publisher/status until VALIDATED/PUBLISHED/FAILED
+5. Write the upload manifest of bundle.zip: <m2repo>/central-deployment.json
+6. Poll /api/v1/publisher/status until VALIDATED/PUBLISHED/FAILED
 ```
 
 Publish mode:
 
 ```text
 1. Poll /api/v1/publisher/status?id=<deployment-id> until it settles
-2. VALIDATED: compare purls, download and hash each file from
+2. VALIDATED: match the upload manifest with the m2repo, compare purls,
+   download and hash each file from
    /api/v1/publisher/deployment/<id>/download/<path>
 3. POST /api/v1/publisher/deployment/<id> to publish
 4. Poll until PUBLISHED
@@ -231,7 +270,7 @@ Use `publishing-type: USER_MANAGED` for safe testing:
 
 The step logic lives in `scripts/`. `tests/` holds a mock Central Portal
 (`mock_central.py`, Python standard library alone) and a suite that drives
-the scripts against it; it needs Python 3.12 or later, bash, curl, jq, zip,
+the scripts against it; it needs Python 3.12 or later, bash, curl, jq, zip, unzip,
 GNU coreutils and gpg:
 
 ```sh

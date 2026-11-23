@@ -4,12 +4,17 @@
 
 # Functions shared by the action's steps; source this file, don't run it.
 
+# The upload manifest, at the root of the m2repo: the deployment ID the
+# Portal returned and the SHA-256 of every file the uploaded bundle held.
+MANIFEST_NAME="central-deployment.json"
+
 # list_bundle_files DIR: print, relative to DIR and sorted, every file the
 # Central bundle carries. This is the one definition of that set: the
 # checksum, signing, signature-check and deployment-check steps all
-# derive theirs from it. Repository bookkeeping stays out at any depth.
+# derive theirs from it. Repository bookkeeping stays out at any depth,
+# and the upload manifest stays out at the root.
 list_bundle_files() {
-  (cd "$1" && find . -type f \
+  (cd "$1" && find . -type f ! -path "./$MANIFEST_NAME" \
     ! -name 'maven-metadata.xml*' ! -name '_remote.repositories' \
     ! -name '*.sha256' ! -name '*.sha512' -print) |
     sed 's|^\./||' | LC_ALL=C sort
@@ -24,6 +29,51 @@ list_payload_files() {
 # list_signable_files DIR: every payload file that needs a .asc beside it.
 list_signable_files() {
   list_payload_files "$1" | awk '!/\.asc$/'
+}
+
+# sha256_of: print the SHA-256 of standard input.
+sha256_of() {
+  sha256sum | awk '{print $1}'
+}
+
+# sidecar md5|sha1: print the content of the .md5 or .sha1 sidecar for
+# standard input, the bare hex digest. Hashing standard input, never a
+# path, keeps md5sum and sha1sum from prefixing a backslash when the path
+# holds one, so the sidecar depends on the file's bytes alone.
+sidecar() {
+  "${1}sum" | awk '{print $1}'
+}
+
+# write_sidecars DIR: write the .md5 and .sha1 sidecar the Central Portal
+# requires beside each payload file in DIR.
+write_sidecars() {
+  local file
+  while IFS= read -r file; do
+    sidecar md5 < "$1/$file" > "$1/${file}.md5"
+    sidecar sha1 < "$1/$file" > "$1/${file}.sha1"
+  done < <(list_payload_files "$1")
+}
+
+# list_bundle_digests DIR: print "<path><TAB><SHA-256>" for every file a
+# bundle built from DIR carries: each payload file, the .md5 and .sha1
+# sidecars the bundle step derives from it, and any orphan .md5 or .sha1
+# file, one with no payload file beside it, which the bundle carries as
+# it is. Derived sidecars' digests come from the payload, not from DIR,
+# which may hold none or stale ones. They hash the bytes write_sidecars
+# writes, from the same sidecar function.
+list_bundle_digests() {
+  local file
+  local -A payload=()
+  while IFS= read -r file; do
+    payload["$file"]=1
+    printf '%s\t%s\n' "$file" "$(sha256_of < "$1/$file")"
+    printf '%s.md5\t%s\n' "$file" "$(sidecar md5 < "$1/$file" | sha256_of)"
+    printf '%s.sha1\t%s\n' "$file" "$(sidecar sha1 < "$1/$file" | sha256_of)"
+  done < <(list_payload_files "$1")
+  while IFS= read -r file; do
+    [ -z "${payload["${file%.*}"]+set}" ] || continue
+    printf '%s\t%s\n' "$file" "$(sha256_of < "$1/$file")"
+  done < <(list_bundle_files "$1" | awk '/\.(md5|sha1)$/')
 }
 
 # list_component_purls DIR: print, sorted, the Maven package URL of each
