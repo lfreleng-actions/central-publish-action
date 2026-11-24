@@ -8,15 +8,17 @@ description: >-
   (signing-method=gpg) or accepts artifacts pre-signed via sigul
   (signing-method=sigul), creates a bundle ZIP, uploads it to Central Portal,
   and polls for deployment status. In 'publish' mode it publishes an existing
-  USER_MANAGED deployment by ID, after checking it against the staged m2repo.
+  USER_MANAGED deployment by ID, after checking it against the staged m2repo
+  and the upload manifest recorded in it.
 
 inputs:
   mode:
     description: >-
       'upload' (default) signs, bundles and uploads m2repo-path as a new
-      deployment. 'publish' publishes the existing deployment named by
-      deployment-id, after checking its files and components against
-      m2repo-path; it signs, bundles and uploads nothing.
+      deployment, then records an upload manifest in m2repo-path. 'publish'
+      publishes the existing deployment named by deployment-id, after
+      checking that it, that manifest and m2repo-path match exactly; it
+      signs, bundles and uploads nothing.
     required: false
     default: "upload"
   deployment-id:
@@ -35,7 +37,8 @@ inputs:
   m2repo-path:
     description: >-
       Path to local Maven repository directory containing artifacts. In
-      publish mode, the signed m2repo staged with the deployment.
+      publish mode, the signed m2repo staged with the deployment, holding
+      the central-deployment.json upload manifest written at upload.
     required: true
     default: "m2repo"
   central-username:
@@ -100,9 +103,15 @@ outputs:
     value: ${{ steps.poll.outputs.deployment_status || steps.publish.outputs.deployment_status }}
   verified_file_count:
     description: >-
-      Publish mode: number of deployment files whose SHA-256 matched
-      m2repo-path (0 when the check did not run)
+      Publish mode: number of deployment files, .md5/.sha1 sidecars
+      included, whose SHA-256 matched m2repo-path and the upload manifest
+      (0 when the check did not run)
     value: ${{ steps.publish.outputs.verified_file_count }}
+  manifest_path:
+    description: >-
+      Upload mode: path of the upload manifest written into m2repo-path
+      (central-deployment.json); publish mode requires it
+    value: ${{ steps.record.outputs.manifest_path }}
   bundle_path:
     description: "Path to created bundle ZIP"
     value: ${{ steps.bundle.outputs.bundle_path }}
@@ -182,7 +191,7 @@ runs:
       shell: bash
       env:
         INPUT_M2REPO: "${{ inputs.m2repo-path }}"
-      run: bash "${GITHUB_ACTION_PATH}/scripts/bundle.sh"
+      run: bash "${GITHUB_ACTION_PATH}/scripts/create-bundle.sh"
 
     - name: Upload bundle to Central Portal
       id: upload
@@ -195,6 +204,16 @@ runs:
         BUNDLE_PATH: "${{ steps.bundle.outputs.bundle_path }}"
         CENTRAL_URL: "${{ inputs.central-url }}"
       run: bash "${GITHUB_ACTION_PATH}/scripts/upload.sh"
+
+    - name: Record deployment manifest
+      id: record
+      if: inputs.mode != 'publish' && steps.validate.outputs.dry-run == 'false'
+      shell: bash
+      env:
+        DEPLOYMENT_ID: "${{ steps.upload.outputs.deployment_id }}"
+        BUNDLE_PATH: "${{ steps.bundle.outputs.bundle_path }}"
+        INPUT_M2REPO: "${{ inputs.m2repo-path }}"
+      run: bash "${GITHUB_ACTION_PATH}/scripts/record-deployment.sh"
 
     - name: Poll deployment status
       id: poll

@@ -3,12 +3,14 @@
 """Drive the action's scripts against a mock Central Portal.
 
 Run with ``python3 -m unittest discover -s tests -t . -v`` on Python 3.12
-or later. The scripts need bash, curl, jq, zip and GNU coreutils; the
+or later. The scripts need bash, curl, jq, zip, unzip and GNU coreutils; the
 signing test also needs gpg.
 """
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import shutil
 import subprocess
@@ -26,6 +28,7 @@ ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS = ROOT / "scripts"
 MALFORMED_DRY_RUN = ["TRUE", " true", "ttrue", "yes", "1", ""]
 WAR = f"org/example/demo/{VERSION}/demo-{VERSION}.war"
+MANIFEST = "central-deployment.json"
 
 
 @dataclass
@@ -47,6 +50,7 @@ class ScriptTestCase(unittest.TestCase):
         self.tmp: Path = Path()
         self.m2repo: Path = Path()
         self.url: str = ""
+        self.bundle_path: str = ""
 
     @override
     def setUp(self) -> None:
@@ -91,12 +95,25 @@ class ScriptTestCase(unittest.TestCase):
             outputs[key] = value
         return Run(proc.returncode, proc.stdout + proc.stderr, outputs)
 
-    def bundle(self) -> dict[str, bytes]:
-        """Bundle the signed fixture repository and return its files."""
+    def bundle(self, extra: tuple[str, ...] = ()) -> dict[str, bytes]:
+        """Bundle the signed fixture, plus ``extra`` artefacts, and return its files."""
         build_m2repo(self.m2repo, signed=True)
-        run = self.run_script("bundle.sh")
+        for relative in extra:
+            path = self.m2repo / relative
+            _ = path.write_bytes(f"content of {relative}\n".encode())
+            _ = path.with_name(path.name + ".asc").write_bytes(b"signature\n")
+        run = self.run_script("create-bundle.sh")
         self.assertEqual(run.code, 0, run.log)
-        return read_bundle(Path(run.outputs["bundle_path"]).read_bytes())
+        self.bundle_path = run.outputs["bundle_path"]
+        return read_bundle(Path(self.bundle_path).read_bytes())
+
+    def record(self, deployment_id: str) -> Run:
+        """Record the upload manifest for ``deployment_id`` from the last bundle."""
+        return self.run_script(
+            "record-deployment.sh",
+            DEPLOYMENT_ID=deployment_id,
+            BUNDLE_PATH=self.bundle_path,
+        )
 
 
 class UploadTests(ScriptTestCase):
@@ -104,13 +121,11 @@ class UploadTests(ScriptTestCase):
 
     def upload(self, publishing_type: str) -> Run:
         """Bundle the fixture and upload it with ``publishing_type``."""
-        build_m2repo(self.m2repo, signed=True)
-        bundled = self.run_script("bundle.sh")
-        self.assertEqual(bundled.code, 0, bundled.log)
+        _ = self.bundle()
         return self.run_script(
             "upload.sh",
             INPUT_PUBLISHING_TYPE=publishing_type,
-            BUNDLE_PATH=bundled.outputs["bundle_path"],
+            BUNDLE_PATH=self.bundle_path,
         )
 
     def poll(
@@ -208,6 +223,50 @@ class UploadTests(ScriptTestCase):
         self.assertNotEqual(uploaded.code, 0, uploaded.log)
         self.assertNotIn("bundle_path", uploaded.outputs)
 
+    def test_records_the_uploaded_files(self) -> None:
+        """The manifest names the deployment and digests each file it holds."""
+        uploaded = self.upload("USER_MANAGED")
+        self.assertEqual(uploaded.code, 0, uploaded.log)
+        deployment_id = uploaded.outputs["deployment_id"]
+        recorded = self.record(deployment_id)
+        self.assertEqual(recorded.code, 0, recorded.log)
+        self.assertEqual(recorded.outputs["manifest_path"], str(self.m2repo / MANIFEST))
+        files = self.central.deployments[deployment_id].files
+        self.assertEqual(
+            json.loads((self.m2repo / MANIFEST).read_text()),
+            {
+                "deploymentId": deployment_id,
+                "files": {
+                    path: hashlib.sha256(data).hexdigest()
+                    for path, data in files.items()
+                },
+            },
+        )
+        rebundled = self.bundle()
+        self.assertNotIn(MANIFEST, rebundled)
+
+    def test_records_the_bundle_not_the_m2repo(self) -> None:
+        """A file removed from the m2repo after bundling stays in the manifest."""
+        uploaded = self.upload("USER_MANAGED")
+        self.assertEqual(uploaded.code, 0, uploaded.log)
+        for suffix in ("", ".md5", ".sha1"):
+            (self.m2repo / f"{WAR}{suffix}").unlink()
+        deployment_id = uploaded.outputs["deployment_id"]
+        recorded = self.record(deployment_id)
+        self.assertEqual(recorded.code, 0, recorded.log)
+        files = self.central.deployments[deployment_id].files
+        self.assertIn(WAR, files)
+        self.assertEqual(
+            json.loads((self.m2repo / MANIFEST).read_text()),
+            {
+                "deploymentId": deployment_id,
+                "files": {
+                    path: hashlib.sha256(data).hexdigest()
+                    for path, data in files.items()
+                },
+            },
+        )
+
 
 class FileSetTests(ScriptTestCase):
     """Sign, verify and bundle the same set of files."""
@@ -215,7 +274,7 @@ class FileSetTests(ScriptTestCase):
     def test_signable_set_covers_every_artefact(self) -> None:
         """Every artefact type needs a signature, not only JARs and POMs."""
         build_m2repo(self.m2repo, signed=True)
-        _ = self.run_script("bundle.sh")
+        _ = self.run_script("create-bundle.sh")
         listed = subprocess.run(
             [
                 "bash",
@@ -288,9 +347,17 @@ class FileSetTests(ScriptTestCase):
 class PublishTests(ScriptTestCase):
     """Publish an existing deployment by ID after checking its contents."""
 
-    def stage(self, states: list[str]) -> Deployment:
-        """Register a deployment holding the fixture's bundle."""
-        return self.central.add(self.bundle(), states)
+    def stage(self, states: list[str], extra: tuple[str, ...] = ()) -> Deployment:
+        """Stage the fixture plus ``extra`` and record its manifest, as upload mode does."""
+        deployment = self.central.add(self.bundle(extra), states)
+        recorded = self.record(deployment.deployment_id)
+        self.assertEqual(recorded.code, 0, recorded.log)
+        return deployment
+
+    def remove_locally(self, relative: str) -> None:
+        """Delete ``relative`` and the sidecars the bundle step left beside it."""
+        for suffix in ("", ".md5", ".sha1"):
+            (self.m2repo / f"{relative}{suffix}").unlink(missing_ok=True)
 
     def publish(self, deployment: Deployment | str, **env: str) -> Run:
         """Run publish mode against ``deployment``."""
@@ -312,16 +379,6 @@ class PublishTests(ScriptTestCase):
         self.assertNotEqual(run.code, 0, run.log)
         self.assertIn(text, run.log)
         self.assertEqual(deployment.publish_calls, 0)
-
-    def test_publishes_a_verified_deployment(self) -> None:
-        """A VALIDATED deployment matching the m2repo gets published."""
-        deployment = self.stage(["VALIDATED"])
-        run = self.publish(deployment)
-        self.assertEqual(run.code, 0, run.log)
-        self.assertEqual(run.outputs["deployment_status"], "PUBLISHED")
-        self.assertEqual(run.outputs["deployment_id"], deployment.deployment_id)
-        self.assertEqual(run.outputs["verified_file_count"], str(2 * len(ARTEFACTS)))
-        self.assertEqual(deployment.publish_calls, 1)
 
     def test_digest_mismatch_fails(self) -> None:
         """A file whose bytes differ from the m2repo blocks publication."""
@@ -434,15 +491,6 @@ class PublishTests(ScriptTestCase):
         self.assertEqual(run.outputs["verified_file_count"], "0")
         self.assertEqual(deployment.publish_calls, 1)
 
-    def test_dry_run_verifies_without_publishing(self) -> None:
-        """dry-run checks the deployment and stops before publishing."""
-        deployment = self.stage(["VALIDATED"])
-        run = self.publish(deployment, INPUT_DRY_RUN="true")
-        self.assertEqual(run.code, 0, run.log)
-        self.assertEqual(run.outputs["deployment_status"], "VALIDATED")
-        self.assertEqual(run.outputs["verified_file_count"], str(2 * len(ARTEFACTS)))
-        self.assertEqual(deployment.publish_calls, 0)
-
     def test_malformed_dry_run_never_publishes(self) -> None:
         """A dry-run value other than true or false fails unpublished."""
         deployment = self.stage(["VALIDATED"])
@@ -450,6 +498,119 @@ class PublishTests(ScriptTestCase):
             with self.subTest(value=value):
                 run = self.publish(deployment, INPUT_DRY_RUN=value)
                 self.assert_fails_unpublished(run, deployment, "dry-run")
+
+    def test_publishes_an_exact_match(self) -> None:
+        """Every bundle file, sidecars included, matches and gets published."""
+        deployment = self.stage(["VALIDATED"])
+        run = self.publish(deployment)
+        self.assertEqual(run.code, 0, run.log)
+        self.assertEqual(run.outputs["verified_file_count"], str(len(deployment.files)))
+        self.assertEqual(len(deployment.files), 6 * len(ARTEFACTS))
+        self.assertEqual(deployment.publish_calls, 1)
+
+    def test_publishes_after_restoring_under_another_root(self) -> None:
+        """Sidecars depend on file bytes, not the root's spelling."""
+        self.m2repo: Path = self.tmp / "m2\\repo"
+        deployment = self.stage(["VALIDATED"])
+        self.assertEqual(
+            deployment.files[f"{WAR}.md5"].decode().strip(),
+            hashlib.md5(deployment.files[WAR], usedforsecurity=False).hexdigest(),
+        )
+        restored = self.tmp / "m2repo"
+        _ = shutil.copytree(self.m2repo, restored)
+        run = self.publish(deployment, INPUT_M2REPO=str(restored))
+        self.assertEqual(run.code, 0, run.log)
+        self.assertEqual(deployment.publish_calls, 1)
+
+    def test_dry_run_verifies_an_exact_match(self) -> None:
+        """dry-run checks every bundle file and leaves the deployment alone."""
+        deployment = self.stage(["VALIDATED"])
+        run = self.publish(deployment, INPUT_DRY_RUN="true")
+        self.assertEqual(run.code, 0, run.log)
+        self.assertEqual(run.outputs["deployment_status"], "VALIDATED")
+        self.assertEqual(run.outputs["verified_file_count"], str(len(deployment.files)))
+        self.assertEqual(deployment.publish_calls, 0)
+
+    def assert_remote_only_fails(self, relative: str) -> None:
+        """A file staged with the deployment but absent locally blocks it."""
+        deployment = self.stage(["VALIDATED"], extra=(relative,))
+        self.remove_locally(relative)
+        self.remove_locally(f"{relative}.asc")
+        self.assert_fails_unpublished(self.publish(deployment), deployment, relative)
+
+    def test_remote_only_file_fails(self) -> None:
+        """A remote-only file of an existing component blocks publication."""
+        self.assert_remote_only_fails(
+            f"org/example/demo/{VERSION}/demo-{VERSION}-extra.jar"
+        )
+
+    def test_remote_only_attachment_fails(self) -> None:
+        """A remote-only attachment of another type blocks publication."""
+        self.assert_remote_only_fails(
+            f"org/example/demo/{VERSION}/demo-{VERSION}.module"
+        )
+
+    def test_file_missing_locally_fails(self) -> None:
+        """A file the restored m2repo lacks blocks publication."""
+        deployment = self.stage(["VALIDATED"])
+        self.remove_locally(WAR)
+        self.remove_locally(f"{WAR}.asc")
+        self.assert_fails_unpublished(self.publish(deployment), deployment, WAR)
+
+    def test_signature_missing_locally_fails(self) -> None:
+        """A signature the restored m2repo lacks blocks publication."""
+        deployment = self.stage(["VALIDATED"])
+        self.remove_locally(f"{WAR}.asc")
+        self.assert_fails_unpublished(
+            self.publish(deployment), deployment, f"{WAR}.asc"
+        )
+
+    def test_sidecar_mismatch_fails(self) -> None:
+        """A checksum sidecar that differs from the m2repo's blocks publication."""
+        deployment = self.stage(["VALIDATED"])
+        deployment.files[f"{WAR}.md5"] = b"0\n"
+        self.assert_fails_unpublished(
+            self.publish(deployment), deployment, f"{WAR}.md5"
+        )
+
+    def test_other_deployment_fails(self) -> None:
+        """A deployment-id other than the recorded one blocks publication."""
+        recorded = self.stage(["VALIDATED"])
+        other = self.central.add(dict(recorded.files), ["VALIDATED"])
+        run = self.publish(other)
+        self.assert_fails_unpublished(run, other, recorded.deployment_id)
+        self.assertEqual(recorded.publish_calls, 0)
+
+    def test_requires_the_upload_manifest(self) -> None:
+        """Without the manifest upload mode records, nothing publishes."""
+        deployment = self.stage(["VALIDATED"])
+        (self.m2repo / MANIFEST).unlink()
+        self.assert_fails_unpublished(self.publish(deployment), deployment, MANIFEST)
+
+    def test_orphan_sidecar_staged_publishes(self) -> None:
+        """An orphan sidecar the bundle carried counts with its own bytes."""
+        orphan = self.m2repo / f"org/example/demo/{VERSION}/notes.txt.md5"
+        build_m2repo(self.m2repo, signed=True)
+        _ = orphan.write_bytes(b"not derived from anything\n")
+        deployment = self.stage(["VALIDATED"])
+        self.assertIn(str(orphan.relative_to(self.m2repo)), deployment.files)
+        run = self.publish(deployment)
+        self.assertEqual(run.code, 0, run.log)
+        self.assertEqual(run.outputs["verified_file_count"], str(len(deployment.files)))
+        self.assertEqual(deployment.publish_calls, 1)
+
+    def test_orphan_sidecar_added_later_fails(self) -> None:
+        """An orphan sidecar added after staging changes the file set."""
+        deployment = self.stage(["VALIDATED"])
+        orphan = f"org/example/demo/{VERSION}/notes.txt.sha1"
+        _ = (self.m2repo / orphan).write_bytes(b"0\n")
+        self.assert_fails_unpublished(self.publish(deployment), deployment, orphan)
+
+    def test_rerun_checks_the_manifest(self) -> None:
+        """A PUBLISHED deployment no longer matching the m2repo fails the re-run."""
+        deployment = self.stage(["PUBLISHED"])
+        self.remove_locally(WAR)
+        self.assert_fails_unpublished(self.publish(deployment), deployment, WAR)
 
 
 class ValidateTests(ScriptTestCase):
@@ -536,6 +697,7 @@ class ValidateTests(ScriptTestCase):
         validated = f'INPUT_DRY_RUN: "${{{{ {output}'
         expected = {
             "Upload bundle to Central Portal": guard,
+            "Record deployment manifest": guard,
             "Poll deployment status": guard,
             "Publish deployment": validated,
             "Generate summary": validated,
