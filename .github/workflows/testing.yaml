@@ -68,7 +68,7 @@ jobs:
       - name: Determine test mode
         id: mode
         env:
-          CENTRAL_USERNAME: ${{ secrets.CENTRAL_USERNAME }}
+          CENTRAL_USERNAME: ${{ vars.CENTRAL_USERNAME }}
           CENTRAL_TOKEN: ${{ secrets.CENTRAL_TOKEN }}
           GPG_PRIVATE_KEY_B64: ${{ secrets.GPG_PRIVATE_KEY_B64 }}
           TEST_NAMESPACE: ${{ vars.CENTRAL_TEST_NAMESPACE }}
@@ -102,8 +102,8 @@ jobs:
             # Never degrade a trusted run to a dry-run: that would hide a
             # regression in the signing and upload path behind a green tick.
             echo "::error::Publishing credentials missing for a trusted run;" \
-              "expected CENTRAL_USERNAME, CENTRAL_TOKEN and" \
-              "GPG_PRIVATE_KEY_B64"
+              "expected the CENTRAL_USERNAME variable and the CENTRAL_TOKEN" \
+              "and GPG_PRIVATE_KEY_B64 secrets"
             exit 1
           else
             echo "::notice::Publishing credentials unavailable; running an" \
@@ -134,6 +134,9 @@ jobs:
             exit 1
           fi
 
+          # The token username is a configuration variable, not a secret;
+          # logging it shows which token the run used.
+          echo "Token username: ${CENTRAL_USERNAME:-(unset)}"
           echo "Signing method: ${signing_method}"
           echo "Dry run: ${dry_run}"
           echo "Namespace: ${namespace}"
@@ -264,7 +267,7 @@ jobs:
         uses: $/
         with:
           m2repo-path: m2repo
-          central-username: ${{ secrets.CENTRAL_USERNAME }}
+          central-username: ${{ vars.CENTRAL_USERNAME }}
           central-token: ${{ secrets.CENTRAL_TOKEN }}
           gpg-private-key: ${{ secrets.GPG_PRIVATE_KEY_B64 }}
           gpg-passphrase: ${{ secrets.GPG_PASSPHRASE }}
