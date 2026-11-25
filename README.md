@@ -280,6 +280,29 @@ python3 -m unittest discover -s tests -t . -v
 The `Mock Portal Tests` CI job runs that suite, then stages and releases a
 deployment through the action itself against the mock. It needs no secrets.
 
+The `Build and Publish Test` CI job builds a small Maven project with a fresh
+`0.0.0-ci.<run id>.<run attempt>` version on every run. On a push to `main`
+or a pull request from this repository, it stages that project on the real
+Central Portal as a `USER_MANAGED` deployment, which stays unpublished until
+someone releases or drops it. A manual run (`workflow_dispatch`) defaults to
+a dry run that uploads nothing; with `dry-run` cleared it stages a
+`USER_MANAGED` deployment, and with `publishing-type: AUTOMATIC` as well it
+publishes the artefact to Maven Central, which nobody can undo. The job
+reads this configuration, at organisation or repository level:
+
+| Name                     | Kind     | Purpose                                         |
+| ------------------------ | -------- | ----------------------------------------------- |
+| `CENTRAL_USERNAME`       | secret   | Central Portal user token name                  |
+| `CENTRAL_TOKEN`          | secret   | Central Portal user token password              |
+| `GPG_PRIVATE_KEY_B64`    | secret   | Base64-encoded GPG private key for signing      |
+| `GPG_PASSPHRASE`         | secret   | Optional; passphrase for that key               |
+| `CENTRAL_TEST_NAMESPACE` | variable | Verified Central namespace, used as the groupId |
+
+A run from this repository fails if any of these, bar `GPG_PASSPHRASE`, is
+missing. Fork and Dependabot pull requests receive no secrets, so they run
+an unsigned dry run instead, with `org.example` as the groupId when the
+variable is unavailable too.
+
 ## License
 
 Apache-2.0

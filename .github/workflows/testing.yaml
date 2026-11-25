@@ -71,6 +71,7 @@ jobs:
           CENTRAL_USERNAME: ${{ secrets.CENTRAL_USERNAME }}
           CENTRAL_TOKEN: ${{ secrets.CENTRAL_TOKEN }}
           GPG_PRIVATE_KEY_B64: ${{ secrets.GPG_PRIVATE_KEY_B64 }}
+          TEST_NAMESPACE: ${{ vars.CENTRAL_TEST_NAMESPACE }}
           DRY_RUN_INPUT: ${{ inputs.dry-run }}
           ACTOR: ${{ github.actor }}
           REPOSITORY: ${{ github.repository }}
@@ -111,10 +112,36 @@ jobs:
             dry_run='true'
           fi
 
+          # The Maven groupId comes from configuration. A run that signs or
+          # is entitled to the secrets must have it; only an unsigned dry
+          # run, whose bundle never leaves the runner, may use a placeholder.
+          if [ -n "${TEST_NAMESPACE}" ]; then
+            namespace="${TEST_NAMESPACE}"
+          elif [ "${signing_method}" = 'gpg' ] ||
+               [ "${credentials_expected}" = 'true' ]; then
+            echo "::error::Test namespace missing for a trusted run;" \
+              "expected the CENTRAL_TEST_NAMESPACE variable"
+            exit 1
+          else
+            namespace='org.example'
+          fi
+
+          groupid_re='^[A-Za-z0-9_-]+(\.[A-Za-z0-9_-]+)*$'
+          if ! [[ "${namespace}" =~ ${groupid_re} ]]; then
+            echo "::error::CENTRAL_TEST_NAMESPACE is not a valid Maven" \
+              "groupId: expected dot-separated segments of letters," \
+              "digits, '-' and '_'"
+            exit 1
+          fi
+
           echo "Signing method: ${signing_method}"
           echo "Dry run: ${dry_run}"
-          echo "signing-method=${signing_method}" >> "$GITHUB_OUTPUT"
-          echo "dry-run=${dry_run}" >> "$GITHUB_OUTPUT"
+          echo "Namespace: ${namespace}"
+          {
+            echo "signing-method=${signing_method}"
+            echo "dry-run=${dry_run}"
+            echo "namespace=${namespace}"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Setup Java
         # yamllint disable-line rule:line-length
@@ -124,27 +151,42 @@ jobs:
           distribution: "temurin"
 
       - name: Create test Maven project
+        env:
+          GROUP_ID: ${{ steps.mode.outputs.namespace }}
+          SERVER_URL: ${{ github.server_url }}
+          REPOSITORY: ${{ github.repository }}
         run: |
           set -euo pipefail
 
-          # Create a minimal Maven project with required Central metadata
-          mkdir -p test-project/src/main/java/io/github/askb/testcentral
+          # A fresh version per run and attempt: Central rejects a second
+          # upload of the same coordinates, and any -SNAPSHOT version.
+          version="0.0.0-ci.${GITHUB_RUN_ID}.${GITHUB_RUN_ATTEMPT}"
+          project_url="${SERVER_URL}/${REPOSITORY}"
+          server_host="${SERVER_URL#*://}"
+          echo "Coordinates: ${GROUP_ID}:test-central-publish:${version}"
+
+          # Create a minimal Maven project with required Central metadata.
+          # The Java package is fixed: a groupId may hold '-', which a Java
+          # package name may not.
+          mkdir -p test-project/src/main/java/centralpublish/citest
           mkdir -p test-project/src/main/javadoc
 
-          cat > test-project/pom.xml << 'POMEOF'
+          # Unquoted delimiter: the POM takes the values above. It holds no
+          # other '$', backtick or backslash for the shell to expand.
+          cat > test-project/pom.xml << POMEOF
           <project xmlns="http://maven.apache.org/POM/4.0.0"
                    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
                    xsi:schemaLocation="http://maven.apache.org/POM/4.0.0
                    http://maven.apache.org/xsd/maven-4.0.0.xsd">
             <modelVersion>4.0.0</modelVersion>
-            <groupId>io.github.askb</groupId>
+            <groupId>${GROUP_ID}</groupId>
             <artifactId>test-central-publish</artifactId>
-            <version>0.0.1-test</version>
+            <version>${version}</version>
             <packaging>jar</packaging>
 
             <name>Test Central Publish</name>
             <description>Test artifact for central-publish-action CI</description>
-            <url>https://github.com/lfreleng-actions/central-publish-action</url>
+            <url>${project_url}</url>
 
             <licenses>
               <license>
@@ -155,15 +197,14 @@ jobs:
 
             <developers>
               <developer>
-                <name>Anil Belur</name>
-                <email>askb23@gmail.com</email>
+                <name>The Linux Foundation Release Engineering</name>
               </developer>
             </developers>
 
             <scm>
-              <connection>scm:git:git://github.com/lfreleng-actions/central-publish-action.git</connection>
-              <developerConnection>scm:git:ssh://github.com:lfreleng-actions/central-publish-action.git</developerConnection>
-              <url>https://github.com/lfreleng-actions/central-publish-action</url>
+              <connection>scm:git:${project_url}.git</connection>
+              <developerConnection>scm:git:ssh://git@${server_host}/${REPOSITORY}.git</developerConnection>
+              <url>${project_url}</url>
             </scm>
 
             <build>
@@ -196,8 +237,8 @@ jobs:
           POMEOF
 
           # Create a minimal Java source file
-          cat > test-project/src/main/java/io/github/askb/testcentral/Hello.java << 'JAVAEOF'
-          package io.github.askb.testcentral;
+          cat > test-project/src/main/java/centralpublish/citest/Hello.java << 'JAVAEOF'
+          package centralpublish.citest;
 
           /** Test class for Maven Central publication testing. */
           public class Hello {
@@ -226,6 +267,7 @@ jobs:
           central-username: ${{ secrets.CENTRAL_USERNAME }}
           central-token: ${{ secrets.CENTRAL_TOKEN }}
           gpg-private-key: ${{ secrets.GPG_PRIVATE_KEY_B64 }}
+          gpg-passphrase: ${{ secrets.GPG_PASSPHRASE }}
           signing-method: ${{ steps.mode.outputs.signing-method }}
           publishing-type: ${{ inputs.publishing-type || 'USER_MANAGED' }}
           dry-run: ${{ steps.mode.outputs.dry-run }}
