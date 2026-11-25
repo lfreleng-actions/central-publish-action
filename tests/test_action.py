@@ -613,6 +613,102 @@ class PublishTests(ScriptTestCase):
         self.assert_fails_unpublished(self.publish(deployment), deployment, WAR)
 
 
+class DropTests(ScriptTestCase):
+    """Drop the deployment a CI run staged, as the testing workflow does."""
+
+    def drop(
+        self, deployment: Deployment | str, event: str = "push", **env: str
+    ) -> Run:
+        """Run the drop script for ``deployment`` on an ``event`` run."""
+        deployment_id = (
+            deployment if isinstance(deployment, str) else deployment.deployment_id
+        )
+        return self.run_script(
+            "drop-deployment.sh",
+            DEPLOYMENT_ID=deployment_id,
+            EVENT_NAME=event,
+            **env,
+        )
+
+    def assert_dropped(self, run: Run, deployment: Deployment) -> None:
+        """Check the run succeeded and the Portal no longer holds ``deployment``."""
+        self.assertEqual(run.code, 0, run.log)
+        self.assertNotIn(deployment.deployment_id, self.central.deployments)
+        self.assertIn(f"Dropped deployment {deployment.deployment_id}", run.log)
+
+    def assert_kept(self, run: Run, deployment: Deployment) -> None:
+        """Check the run succeeded without asking to drop ``deployment``."""
+        self.assertEqual(run.code, 0, run.log)
+        self.assertIn(deployment.deployment_id, self.central.deployments)
+        self.assertEqual(self.central.drop_requests, [])
+
+    def test_drops_a_validated_deployment(self) -> None:
+        """Push, schedule and pull request runs drop a VALIDATED deployment."""
+        for event in ("push", "schedule", "pull_request"):
+            with self.subTest(event=event):
+                deployment = self.central.add({}, ["VALIDATED"])
+                self.assert_dropped(self.drop(deployment, event), deployment)
+
+    def test_drops_a_failed_deployment(self) -> None:
+        """A deployment the Portal rejected is dropped too."""
+        deployment = self.central.add({}, ["FAILED"])
+        self.assert_dropped(self.drop(deployment, "schedule"), deployment)
+
+    def test_waits_for_validation_before_dropping(self) -> None:
+        """A deployment still validating is dropped once it settles."""
+        deployment = self.central.add({}, ["PENDING", "VALIDATING", "VALIDATED"])
+        self.assert_dropped(self.drop(deployment), deployment)
+
+    def test_never_drops_a_published_deployment(self) -> None:
+        """PUBLISHING and PUBLISHED deployments are left alone."""
+        for state in ("PUBLISHING", "PUBLISHED"):
+            with self.subTest(state=state):
+                deployment = self.central.add({}, [state])
+                run = self.drop(deployment)
+                self.assert_kept(run, deployment)
+                self.assertIn(
+                    f"Deployment {deployment.deployment_id} is {state}", run.log
+                )
+
+    def test_manual_run_keeps_its_deployment(self) -> None:
+        """A workflow_dispatch run names the deployment and keeps it."""
+        deployment = self.central.add({}, ["VALIDATED"])
+        run = self.drop(deployment, "workflow_dispatch")
+        self.assert_kept(run, deployment)
+        self.assertIn(
+            f"Keeping deployment {deployment.deployment_id} (VALIDATED)", run.log
+        )
+        self.assertIn("drop it in the Central Portal", run.log)
+
+    def test_failed_drop_fails(self) -> None:
+        """A refused drop request fails with an error naming the deployment."""
+        deployment = self.central.add({}, ["VALIDATED"])
+        self.central.drop_reply = (500, "internal error")
+        run = self.drop(deployment)
+        self.assertNotEqual(run.code, 0, run.log)
+        self.assertIn(
+            f"::error::Could not drop deployment {deployment.deployment_id}", run.log
+        )
+        self.assertIn("internal error", run.log)
+
+    def test_unsettled_deployment_fails(self) -> None:
+        """A deployment that never settles is reported, not silently kept."""
+        deployment = self.central.add({}, ["VALIDATING"])
+        run = self.drop(deployment, INPUT_POLL_TIMEOUT="2")
+        self.assertNotEqual(run.code, 0, run.log)
+        self.assertIn(
+            f"::error::Could not drop deployment {deployment.deployment_id}", run.log
+        )
+        self.assertEqual(self.central.drop_requests, [])
+
+    def test_rejects_a_malformed_deployment_id(self) -> None:
+        """Only a UUID reaches the Portal's URL."""
+        run = self.drop("../../upload")
+        self.assertNotEqual(run.code, 0, run.log)
+        self.assertIn("::error::deployment-id '../../upload'", run.log)
+        self.assertEqual(self.central.drop_requests, [])
+
+
 class ValidateTests(ScriptTestCase):
     """Reject inconsistent inputs before any work starts."""
 

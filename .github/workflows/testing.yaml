@@ -18,10 +18,6 @@ on:
         description: "Dry run (skip upload)"
         type: boolean
         default: true
-      debug:
-        description: "Enable debug logging"
-        type: boolean
-        default: false
   push:
     branches: [main]
     paths:
@@ -40,22 +36,31 @@ on:
       - "scripts/**"
       - "tests/**"
       - ".github/workflows/testing.yaml"
+  # Weekly, on main: catches what breaks outside this repository, such as an
+  # expired token, a revoked signing key or a Portal API change.
+  schedule:
+    - cron: "37 4 * * 1"
 
 permissions: {}
 
+# A new push to a pull request cancels its previous run. Every other run
+# (push, schedule, workflow_dispatch) gets a group of its own, so no merge to
+# main cancels, or queues behind, another's upload.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   build:
     name: 'Build and Publish Test'
-    # Scopes the publishing secrets to a dedicated environment. No reviewers
-    # are configured: the trigger is pull_request, so fork PRs never receive
-    # secrets and need no manual gate.
+    # Records each run as a deployment to this environment. It holds no
+    # secrets and has no protection rules: the credentials below come from
+    # organisation and repository configuration, and fork pull requests never
+    # receive them.
     environment: integration-auto
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    # Room for the action's own polling plus the wait before a drop
+    timeout-minutes: 20
     permissions:
       contents: read  # Read repository contents
     steps:
@@ -65,6 +70,13 @@ jobs:
         with:
           egress-policy: audit
 
+      # Only for scripts/drop-deployment.sh; the action itself comes from $/
+      # yamllint disable-line rule:line-length
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: scripts
+
       - name: Determine test mode
         id: mode
         env:
@@ -73,6 +85,7 @@ jobs:
           GPG_PRIVATE_KEY_B64: ${{ secrets.GPG_PRIVATE_KEY_B64 }}
           TEST_NAMESPACE: ${{ vars.CENTRAL_TEST_NAMESPACE }}
           DRY_RUN_INPUT: ${{ inputs.dry-run }}
+          EVENT_NAME: ${{ github.event_name }}
           ACTOR: ${{ github.actor }}
           REPOSITORY: ${{ github.repository }}
           PR_HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
@@ -82,9 +95,13 @@ jobs:
 
           # A run is entitled to the repository secrets unless it comes from
           # a fork pull request or from Dependabot (which reads a separate
-          # secret store). PR_HEAD_REPO is empty for non-PR events.
+          # secret store). PR_HEAD_REPO is empty for non-PR events. A
+          # scheduled run is always trusted: it runs main, whoever its
+          # actor is.
           credentials_expected='true'
-          if [ "${ACTOR}" = 'dependabot[bot]' ]; then
+          if [ "${EVENT_NAME}" = 'schedule' ]; then
+            :
+          elif [ "${ACTOR}" = 'dependabot[bot]' ]; then
             credentials_expected='false'
           elif [ -n "${PR_HEAD_REPO}" ] &&
                [ "${PR_HEAD_REPO}" != "${REPOSITORY}" ]; then
@@ -264,6 +281,7 @@ jobs:
           find "${GITHUB_WORKSPACE}/m2repo" -type f | sort
 
       - name: Run central-publish-action
+        id: publish
         uses: $/
         with:
           m2repo-path: m2repo
@@ -274,6 +292,21 @@ jobs:
           signing-method: ${{ steps.mode.outputs.signing-method }}
           publishing-type: ${{ inputs.publishing-type || 'USER_MANAGED' }}
           dry-run: ${{ steps.mode.outputs.dry-run }}
+
+      # Drops a VALIDATED or FAILED test deployment, even after a failure, so
+      # none is left for a stray click on "Publish" to release. Manual runs
+      # keep theirs for inspection; see the script for the rules.
+      - name: Drop the test deployment
+        if: always() && steps.publish.outputs.deployment_id != ''
+        env:
+          CENTRAL_URL: https://central.sonatype.com
+          CENTRAL_USERNAME: ${{ vars.CENTRAL_USERNAME }}
+          CENTRAL_TOKEN: ${{ secrets.CENTRAL_TOKEN }}
+          DEPLOYMENT_ID: ${{ steps.publish.outputs.deployment_id }}
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_POLL_TIMEOUT: "180"
+          INPUT_POLL_INTERVAL: "15"
+        run: bash scripts/drop-deployment.sh
 
   mock-portal:
     name: 'Mock Portal Tests'
@@ -395,19 +428,43 @@ jobs:
       - name: Change an artefact after staging
         run: echo tampered >> m2repo/org/example/demo/1.0.0/demo-1.0.0.war
 
+      # Runs publish mode's script directly, with its output captured, so
+      # the refusal it is meant to produce leaves no error annotation on a
+      # green run; the check is on the exit status and the reason given.
       - name: Release a deployment that no longer matches
-        id: mismatch
-        continue-on-error: true
-        uses: $/
-        with:
-          mode: publish
-          deployment-id: ${{ steps.stage-again.outputs.deployment_id }}
-          m2repo-path: m2repo
-          central-url: http://127.0.0.1:8765
-          central-username: user
-          central-token: token
-          poll-interval: "1"
-          poll-timeout: "30"
+        env:
+          CENTRAL_URL: http://127.0.0.1:8765
+          CENTRAL_USERNAME: user
+          CENTRAL_TOKEN: token
+          INPUT_DEPLOYMENT_ID: ${{ steps.stage-again.outputs.deployment_id }}
+          INPUT_M2REPO: m2repo
+          INPUT_SKIP_VERIFICATION: "false"
+          INPUT_DRY_RUN: "false"
+          INPUT_POLL_INTERVAL: "1"
+          INPUT_POLL_TIMEOUT: "30"
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP}/mismatch.log"
+          status=0
+          GITHUB_OUTPUT="${RUNNER_TEMP}/mismatch-output" \
+            bash scripts/publish.sh > "$log" 2>&1 || status=$?
+          # Prefixed, so the runner reads none of its lines as a command
+          sed 's/^/| /' "$log"
+          war='org/example/demo/1.0.0/demo-1.0.0.war'
+          refusal="::error::Deployment ${INPUT_DEPLOYMENT_ID} does not match"
+          refusal="${refusal} ${INPUT_M2REPO}; not publishing it"
+          if [ "$status" -eq 0 ]; then
+            echo "::error::Publish mode accepted a deployment that no longer" \
+              "matches ${INPUT_M2REPO}"
+            exit 1
+          fi
+          if ! grep -qxF "$refusal" "$log" ||
+             ! grep -qF "::error::SHA-256 mismatch for ${war}:" "$log"; then
+            echo "::error::Publish mode failed (exit ${status}) for a reason" \
+              "other than the changed ${war}; see its log above"
+            exit 1
+          fi
+          echo "Publish mode refused the changed deployment (exit ${status})"
 
       - name: Check release results
         env:
@@ -415,7 +472,6 @@ jobs:
           RELEASE_STATUS: ${{ steps.release.outputs.deployment_status }}
           RELEASE_VERIFIED: ${{ steps.release.outputs.verified_file_count }}
           RERUN_STATUS: ${{ steps.rerun.outputs.deployment_status }}
-          MISMATCH_OUTCOME: ${{ steps.mismatch.outcome }}
           MISMATCH_ID: ${{ steps.stage-again.outputs.deployment_id }}
         run: |
           set -euo pipefail
@@ -424,7 +480,6 @@ jobs:
           test "$RELEASE_VERIFIED" -gt 0
           test "$RERUN_STATUS" = PUBLISHED
           test "$(curl -sf "${mock}/${DEPLOYMENT_ID}" | jq .publishCalls)" = 1
-          test "$MISMATCH_OUTCOME" = failure
           test "$(curl -sf "${mock}/${MISMATCH_ID}" | jq .publishCalls)" = 0
           echo "Release, idempotent re-run and mismatch checks passed"
 
