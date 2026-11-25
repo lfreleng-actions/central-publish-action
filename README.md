@@ -292,7 +292,7 @@ reads this configuration, at organisation or repository level:
 
 | Name                     | Kind     | Purpose                                         |
 | ------------------------ | -------- | ----------------------------------------------- |
-| `CENTRAL_USERNAME`       | secret   | Central Portal user token name                  |
+| `CENTRAL_USERNAME`       | variable | Central Portal user token name                  |
 | `CENTRAL_TOKEN`          | secret   | Central Portal user token password              |
 | `GPG_PRIVATE_KEY_B64`    | secret   | Base64-encoded GPG private key for signing      |
 | `GPG_PASSPHRASE`         | secret   | Optional; passphrase for that key               |
@@ -300,8 +300,9 @@ reads this configuration, at organisation or repository level:
 
 A run from this repository fails if any of these, bar `GPG_PASSPHRASE`, is
 missing. Fork and Dependabot pull requests receive no secrets, so they run
-an unsigned dry run instead, with `org.example` as the groupId when the
-variable is unavailable too.
+an unsigned dry run instead, even when the variables are available, with
+`org.example` as the groupId when `CENTRAL_TEST_NAMESPACE` is unavailable
+too.
 
 ## License
 
