@@ -18,10 +18,6 @@ on:
         description: "Dry run (skip upload)"
         type: boolean
         default: true
-      debug:
-        description: "Enable debug logging"
-        type: boolean
-        default: false
   push:
     branches: [main]
     paths:
@@ -40,19 +36,27 @@ on:
       - "scripts/**"
       - "tests/**"
       - ".github/workflows/testing.yaml"
+  # Weekly, on main: catches what breaks outside this repository, such as an
+  # expired token, a revoked signing key or a Portal API change.
+  schedule:
+    - cron: "37 4 * * 1"
 
 permissions: {}
 
+# A new push to a pull request cancels its previous run. Every other run
+# (push, schedule, workflow_dispatch) gets a group of its own, so no merge to
+# main cancels, or queues behind, another's upload.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   build:
     name: 'Build and Publish Test'
-    # Scopes the publishing secrets to a dedicated environment. No reviewers
-    # are configured: the trigger is pull_request, so fork PRs never receive
-    # secrets and need no manual gate.
+    # Records each run as a deployment to this environment. It holds no
+    # secrets and has no protection rules: the credentials below come from
+    # organisation and repository configuration, and fork pull requests never
+    # receive them.
     environment: integration-auto
     runs-on: ubuntu-24.04
     # Room for the action's own polling plus the wait before a drop
@@ -81,6 +85,7 @@ jobs:
           GPG_PRIVATE_KEY_B64: ${{ secrets.GPG_PRIVATE_KEY_B64 }}
           TEST_NAMESPACE: ${{ vars.CENTRAL_TEST_NAMESPACE }}
           DRY_RUN_INPUT: ${{ inputs.dry-run }}
+          EVENT_NAME: ${{ github.event_name }}
           ACTOR: ${{ github.actor }}
           REPOSITORY: ${{ github.repository }}
           PR_HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
@@ -90,9 +95,13 @@ jobs:
 
           # A run is entitled to the repository secrets unless it comes from
           # a fork pull request or from Dependabot (which reads a separate
-          # secret store). PR_HEAD_REPO is empty for non-PR events.
+          # secret store). PR_HEAD_REPO is empty for non-PR events. A
+          # scheduled run is always trusted: it runs main, whoever its
+          # actor is.
           credentials_expected='true'
-          if [ "${ACTOR}" = 'dependabot[bot]' ]; then
+          if [ "${EVENT_NAME}" = 'schedule' ]; then
+            :
+          elif [ "${ACTOR}" = 'dependabot[bot]' ]; then
             credentials_expected='false'
           elif [ -n "${PR_HEAD_REPO}" ] &&
                [ "${PR_HEAD_REPO}" != "${REPOSITORY}" ]; then
