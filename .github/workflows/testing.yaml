@@ -428,19 +428,43 @@ jobs:
       - name: Change an artefact after staging
         run: echo tampered >> m2repo/org/example/demo/1.0.0/demo-1.0.0.war
 
+      # Runs publish mode's script directly, with its output captured, so
+      # the refusal it is meant to produce leaves no error annotation on a
+      # green run; the check is on the exit status and the reason given.
       - name: Release a deployment that no longer matches
-        id: mismatch
-        continue-on-error: true
-        uses: $/
-        with:
-          mode: publish
-          deployment-id: ${{ steps.stage-again.outputs.deployment_id }}
-          m2repo-path: m2repo
-          central-url: http://127.0.0.1:8765
-          central-username: user
-          central-token: token
-          poll-interval: "1"
-          poll-timeout: "30"
+        env:
+          CENTRAL_URL: http://127.0.0.1:8765
+          CENTRAL_USERNAME: user
+          CENTRAL_TOKEN: token
+          INPUT_DEPLOYMENT_ID: ${{ steps.stage-again.outputs.deployment_id }}
+          INPUT_M2REPO: m2repo
+          INPUT_SKIP_VERIFICATION: "false"
+          INPUT_DRY_RUN: "false"
+          INPUT_POLL_INTERVAL: "1"
+          INPUT_POLL_TIMEOUT: "30"
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP}/mismatch.log"
+          status=0
+          GITHUB_OUTPUT="${RUNNER_TEMP}/mismatch-output" \
+            bash scripts/publish.sh > "$log" 2>&1 || status=$?
+          # Prefixed, so the runner reads none of its lines as a command
+          sed 's/^/| /' "$log"
+          war='org/example/demo/1.0.0/demo-1.0.0.war'
+          refusal="::error::Deployment ${INPUT_DEPLOYMENT_ID} does not match"
+          refusal="${refusal} ${INPUT_M2REPO}; not publishing it"
+          if [ "$status" -eq 0 ]; then
+            echo "::error::Publish mode accepted a deployment that no longer" \
+              "matches ${INPUT_M2REPO}"
+            exit 1
+          fi
+          if ! grep -qxF "$refusal" "$log" ||
+             ! grep -qF "::error::SHA-256 mismatch for ${war}:" "$log"; then
+            echo "::error::Publish mode failed (exit ${status}) for a reason" \
+              "other than the changed ${war}; see its log above"
+            exit 1
+          fi
+          echo "Publish mode refused the changed deployment (exit ${status})"
 
       - name: Check release results
         env:
@@ -448,7 +472,6 @@ jobs:
           RELEASE_STATUS: ${{ steps.release.outputs.deployment_status }}
           RELEASE_VERIFIED: ${{ steps.release.outputs.verified_file_count }}
           RERUN_STATUS: ${{ steps.rerun.outputs.deployment_status }}
-          MISMATCH_OUTCOME: ${{ steps.mismatch.outcome }}
           MISMATCH_ID: ${{ steps.stage-again.outputs.deployment_id }}
         run: |
           set -euo pipefail
@@ -457,7 +480,6 @@ jobs:
           test "$RELEASE_VERIFIED" -gt 0
           test "$RERUN_STATUS" = PUBLISHED
           test "$(curl -sf "${mock}/${DEPLOYMENT_ID}" | jq .publishCalls)" = 1
-          test "$MISMATCH_OUTCOME" = failure
           test "$(curl -sf "${mock}/${MISMATCH_ID}" | jq .publishCalls)" = 0
           echo "Release, idempotent re-run and mismatch checks passed"
 
