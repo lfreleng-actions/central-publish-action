@@ -55,7 +55,8 @@ jobs:
     # secrets and need no manual gate.
     environment: integration-auto
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    # Room for the action's own polling plus the wait before a drop
+    timeout-minutes: 20
     permissions:
       contents: read  # Read repository contents
     steps:
@@ -64,6 +65,13 @@ jobs:
       - uses: step-security/harden-runner@aebdcf6156ab6691adf63218240e476564a1ed4c  # v2.23.0
         with:
           egress-policy: audit
+
+      # Only for scripts/drop-deployment.sh; the action itself comes from $/
+      # yamllint disable-line rule:line-length
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: scripts
 
       - name: Determine test mode
         id: mode
@@ -264,6 +272,7 @@ jobs:
           find "${GITHUB_WORKSPACE}/m2repo" -type f | sort
 
       - name: Run central-publish-action
+        id: publish
         uses: $/
         with:
           m2repo-path: m2repo
@@ -274,6 +283,21 @@ jobs:
           signing-method: ${{ steps.mode.outputs.signing-method }}
           publishing-type: ${{ inputs.publishing-type || 'USER_MANAGED' }}
           dry-run: ${{ steps.mode.outputs.dry-run }}
+
+      # Drops a VALIDATED or FAILED test deployment, even after a failure, so
+      # none is left for a stray click on "Publish" to release. Manual runs
+      # keep theirs for inspection; see the script for the rules.
+      - name: Drop the test deployment
+        if: always() && steps.publish.outputs.deployment_id != ''
+        env:
+          CENTRAL_URL: https://central.sonatype.com
+          CENTRAL_USERNAME: ${{ vars.CENTRAL_USERNAME }}
+          CENTRAL_TOKEN: ${{ secrets.CENTRAL_TOKEN }}
+          DEPLOYMENT_ID: ${{ steps.publish.outputs.deployment_id }}
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_POLL_TIMEOUT: "180"
+          INPUT_POLL_INTERVAL: "15"
+        run: bash scripts/drop-deployment.sh
 
   mock-portal:
     name: 'Mock Portal Tests'

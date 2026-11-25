@@ -642,7 +642,6 @@ class DropTests(ScriptTestCase):
         self.assertIn(deployment.deployment_id, self.central.deployments)
         self.assertEqual(self.central.drop_requests, [])
 
-    @unittest.expectedFailure
     def test_drops_a_validated_deployment(self) -> None:
         """Push, schedule and pull request runs drop a VALIDATED deployment."""
         for event in ("push", "schedule", "pull_request"):
@@ -650,19 +649,16 @@ class DropTests(ScriptTestCase):
                 deployment = self.central.add({}, ["VALIDATED"])
                 self.assert_dropped(self.drop(deployment, event), deployment)
 
-    @unittest.expectedFailure
     def test_drops_a_failed_deployment(self) -> None:
         """A deployment the Portal rejected is dropped too."""
         deployment = self.central.add({}, ["FAILED"])
         self.assert_dropped(self.drop(deployment, "schedule"), deployment)
 
-    @unittest.expectedFailure
     def test_waits_for_validation_before_dropping(self) -> None:
         """A deployment still validating is dropped once it settles."""
         deployment = self.central.add({}, ["PENDING", "VALIDATING", "VALIDATED"])
         self.assert_dropped(self.drop(deployment), deployment)
 
-    @unittest.expectedFailure
     def test_never_drops_a_published_deployment(self) -> None:
         """PUBLISHING and PUBLISHED deployments are left alone."""
         for state in ("PUBLISHING", "PUBLISHED"):
@@ -674,7 +670,6 @@ class DropTests(ScriptTestCase):
                     f"Deployment {deployment.deployment_id} is {state}", run.log
                 )
 
-    @unittest.expectedFailure
     def test_manual_run_keeps_its_deployment(self) -> None:
         """A workflow_dispatch run names the deployment and keeps it."""
         deployment = self.central.add({}, ["VALIDATED"])
@@ -685,7 +680,6 @@ class DropTests(ScriptTestCase):
         )
         self.assertIn("drop it in the Central Portal", run.log)
 
-    @unittest.expectedFailure
     def test_failed_drop_fails(self) -> None:
         """A refused drop request fails with an error naming the deployment."""
         deployment = self.central.add({}, ["VALIDATED"])
@@ -697,7 +691,6 @@ class DropTests(ScriptTestCase):
         )
         self.assertIn("internal error", run.log)
 
-    @unittest.expectedFailure
     def test_unsettled_deployment_fails(self) -> None:
         """A deployment that never settles is reported, not silently kept."""
         deployment = self.central.add({}, ["VALIDATING"])
@@ -708,7 +701,6 @@ class DropTests(ScriptTestCase):
         )
         self.assertEqual(self.central.drop_requests, [])
 
-    @unittest.expectedFailure
     def test_rejects_a_malformed_deployment_id(self) -> None:
         """Only a UUID reaches the Portal's URL."""
         run = self.drop("../../upload")

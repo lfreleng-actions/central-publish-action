@@ -283,10 +283,14 @@ deployment through the action itself against the mock. It needs no secrets.
 The `Build and Publish Test` CI job builds a small Maven project with a fresh
 `0.0.0-ci.<run id>.<run attempt>` version on every run. On a push to `main`
 or a pull request from this repository, it stages that project on the real
-Central Portal as a `USER_MANAGED` deployment, which stays unpublished until
-someone releases or drops it. A manual run (`workflow_dispatch`) defaults to
-a dry run that uploads nothing; with `dry-run` cleared it stages a
-`USER_MANAGED` deployment, and with `publishing-type: AUTOMATIC` as well it
+Central Portal as a `USER_MANAGED` deployment, then drops it through the
+Publisher API once validation settles, whether the run passed or failed.
+The drop step leaves any `PUBLISHING` or `PUBLISHED` deployment alone, and
+fails the job, naming the deployment, when it cannot drop a `VALIDATED` or
+`FAILED` one. A manual run (`workflow_dispatch`) defaults to a dry
+run that uploads nothing; with `dry-run` cleared it stages a `USER_MANAGED`
+deployment and keeps it for inspection, logging its ID: drop it in the
+Portal afterwards. With `publishing-type: AUTOMATIC` as well, a manual run
 publishes the artefact to Maven Central, which nobody can undo. The job
 reads this configuration, at organisation or repository level:
 
