@@ -7,11 +7,14 @@ It models the endpoints the action calls:
 - ``POST /api/v1/publisher/upload`` stores a bundle and returns its ID
 - ``POST /api/v1/publisher/status`` reports the deployment state
 - ``POST /api/v1/publisher/deployment/<id>`` publishes a deployment
+- ``DELETE /api/v1/publisher/deployment/<id>`` drops a VALIDATED or
+  FAILED deployment
 - ``GET /api/v1/publisher/deployment/<id>/download/<path>`` serves a file
 
 Each deployment walks through a list of states: every status request
 returns the head of the list and then advances, until one state remains.
-``GET /_mock/deployments/<id>`` exposes the recorded publish calls.
+``GET /_mock/deployments/<id>`` exposes the recorded publish calls;
+``MockCentral.drop_requests`` records the ID of every drop request.
 
 Run it as a script to serve on a fixed port for an end-to-end job.
 """
@@ -35,6 +38,7 @@ from typing import ClassVar, override
 from urllib.parse import parse_qs, unquote, urlsplit
 
 API = "/api/v1/publisher"
+DROPPABLE_STATES = frozenset({"VALIDATED", "FAILED"})
 DEFAULT_STATES: dict[str, list[str]] = {
     "USER_MANAGED": ["PENDING", "VALIDATING", "VALIDATED"],
     "AUTOMATIC": ["PENDING", "VALIDATING", "VALIDATED", "PUBLISHING", "PUBLISHED"],
@@ -110,6 +114,8 @@ class MockCentral:
         self.after_publish: list[str] = ["PUBLISHING", "PUBLISHED"]
         self.download_states: set[str] = {"VALIDATED"}
         self.upload_reply: tuple[int, str] | None = None
+        self.drop_reply: tuple[int, str] | None = None
+        self.drop_requests: list[str] = []
         self.status_delay: float = 0.0
         self.lock: threading.Lock = threading.Lock()
         self.server: _Server | None = None
@@ -245,6 +251,30 @@ class _Handler(BaseHTTPRequestHandler):
                 self.reply(204)
             else:
                 self.reply_json(404, {"error": "unknown endpoint"})
+
+    def do_DELETE(self) -> None:
+        url = urlsplit(self.path)
+        prefix = f"{API}/deployment/"
+        if not self.authorised():
+            return
+        if not url.path.startswith(prefix) or "/" in url.path[len(prefix) :]:
+            self.reply_json(404, {"error": "unknown endpoint"})
+            return
+        deployment_id = url.path[len(prefix) :]
+        with self.central.lock:
+            self.central.drop_requests.append(deployment_id)
+            if self.central.drop_reply is not None:
+                status, text = self.central.drop_reply
+                self.reply(status, text.encode())
+                return
+            deployment = self.lookup(deployment_id)
+            if deployment is None:
+                return
+            if deployment.state not in DROPPABLE_STATES:
+                self.reply_json(400, {"error": f"deployment is {deployment.state}"})
+                return
+            del self.central.deployments[deployment_id]
+            self.reply(204)
 
     def upload(self, payload: bytes, publishing_type: str) -> None:
         if self.central.upload_reply is not None:
