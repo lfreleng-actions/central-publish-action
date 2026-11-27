@@ -28,14 +28,11 @@ on:
   # Deliberately pull_request (not pull_request_target): the job checks out
   # and runs the code under test, so it must stay unprivileged. Fork PRs
   # therefore receive no secrets and degrade to an unsigned, upload-free
-  # run; see the 'Determine test mode' step below.
+  # run; see the 'Determine test mode' step below. No paths filter: the
+  # default branch ruleset requires 'Build and Publish Test', so it must
+  # report on every pull request or the pull request cannot merge.
   pull_request:
     branches: [main]
-    paths:
-      - "action.yaml"
-      - "scripts/**"
-      - "tests/**"
-      - ".github/workflows/testing.yaml"
   # Weekly, on main: catches what breaks outside this repository, such as an
   # expired token, a revoked signing key or a Portal API change.
   schedule:

@@ -288,12 +288,17 @@ Portal as a `USER_MANAGED` deployment, then drops it through the
 Publisher API once validation settles, whether the run passed or failed.
 The drop step leaves any `PUBLISHING` or `PUBLISHED` deployment alone, and
 fails the job, naming the deployment, when it cannot drop a `VALIDATED` or
-`FAILED` one. A manual run (`workflow_dispatch`) defaults to a dry
-run that uploads nothing; with `dry-run` cleared it stages a `USER_MANAGED`
-deployment and keeps it for inspection, logging its ID: drop it in the
-Portal afterwards. With `publishing-type: AUTOMATIC` as well, a manual run
-publishes the artefact to Maven Central, which nobody can undo. The job
-reads this configuration, at organisation or repository level:
+`FAILED` one. Both CI jobs run on every pull request to `main`, whatever
+it changes: the default branch ruleset requires `Build and Publish Test`,
+so a path filter on the `pull_request` trigger would leave pull requests
+outside it unable to merge. A push to `main` runs them when it changes
+the action, `scripts/`, `tests/` or the workflow, and not otherwise. A
+manual run (`workflow_dispatch`) defaults to a dry run that uploads
+nothing; with `dry-run` cleared it stages a `USER_MANAGED` deployment and
+keeps it for inspection, logging its ID: drop it in the Portal afterwards.
+With `publishing-type: AUTOMATIC` as well, a manual run publishes the
+artefact to Maven Central, which nobody can undo. The job reads this
+configuration, at organisation or repository level:
 
 | Name                     | Kind     | Purpose                                         |
 | ------------------------ | -------- | ----------------------------------------------- |
